@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <iterator>
 
-#define STRATA_VERSION L"0.1.0"
+#define STRATA_VERSION L"0.1.1"
 #define STRATA_WNDCLASS L"StrataMain"
 
 // Messages posted to the main window
@@ -28,7 +28,7 @@ constexpr UINT WM_STRATA_ICONS      = WM_APP + 2;  // lParam: IconBatch* (real i
 constexpr UINT WM_STRATA_DRIVES     = WM_APP + 3;  // lParam: std::vector<DriveInfo>*
 constexpr UINT WM_STRATA_DIRCHANGED = WM_APP + 4;  // wParam: watcher generation
 constexpr UINT WM_STRATA_OPDONE     = WM_APP + 5;  // lParam: OpResult*
-constexpr UINT WM_STRATA_SUBFOLDERS = WM_APP + 6;  // reserved
+constexpr UINT WM_STRATA_SEARCH     = WM_APP + 6;  // lParam: SearchBatch*
 
 // ---- log.cpp ----
 void LogInit();

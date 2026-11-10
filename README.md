@@ -3,7 +3,7 @@
 A fast, modern, keyboard-first File Explorer replacement for Windows.
 Part of the larosa023 suite of lightweight Windows apps (Foyer, Faderly, Ember, Tonely, Mantel, Marq, Lumora…).
 
-**Status: v0.1.0 (Phase 1)** — tabbed window, breadcrumb path bar, instant folder filter, sidebar with
+**Status: v0.1.1 (Phase 1)** — tabbed window, breadcrumb path bar, instant folder filter, whole-PC search (Everything or built-in scan), sidebar with
 pinned folders and drives, a virtualized sortable file list, and open / copy / move / rename / delete
 through the Windows copy engine.
 
@@ -30,7 +30,7 @@ folder beside it instead of `%APPDATA%\Strata`.
 | **Tabs** | Ctrl+T new · Ctrl+W close · Ctrl+Shift+T reopen closed · Ctrl+Tab / Ctrl+PgUp/PgDn switch · Ctrl+1…9 · drag to reorder · middle-click to close · right-click for Duplicate / Close others · mouse wheel over the tab strip |
 | **Navigate** | Enter or double-click opens · Backspace or Alt+↑ goes up · Alt+← / Alt+→ (or mouse back/forward buttons) · middle-click or Ctrl+click a folder to open it in a new tab |
 | **Path bar** | Click a segment to jump · click a **›** to pick a sibling folder · click empty space (or Ctrl+L / Alt+D) to type a path — `%USERPROFILE%`, `~`, relative paths, and a file path (opens its folder and selects it) all work |
-| **Search** | Ctrl+K (or Ctrl+F) filters the current folder as you type; `*` and `?` wildcards work · Esc clears |
+| **Search** | Ctrl+K (or Ctrl+F). On **This PC** it searches every drive — instantly if [Everything](https://www.voidtools.com/) is running, otherwise with a background scan. In a folder it filters as you type; **Enter** searches all subfolders. `*` and `?` wildcards work · Esc clears |
 | **Select** | Click, Ctrl+click, Shift+click, Ctrl+A, drag a box in empty space · type a name to jump to it |
 | **Files** | F2 rename · Del → Recycle Bin · Shift+Del delete permanently · Ctrl+C / Ctrl+X / Ctrl+V (works with File Explorer both ways) · Ctrl+Shift+N new folder · Ctrl+Shift+C copy path · Alt+Enter properties |
 | **View** | Click a column header to sort, drag its edge to resize, right-click it to choose columns · Ctrl+H show hidden items · F5 or Ctrl+R refresh |
@@ -74,6 +74,7 @@ src/
   window.cpp/.h   main window: title bar + tabs, toolbar, breadcrumb, sidebar, list, status bar, input
   fs.cpp/.h       background folder listing, drives, folder change watching, path helpers
   shell.cpp/.h    icons, Windows context menu, IFileOperation, clipboard, launching
+  search.cpp/.h   search: Everything IPC when available, background scan otherwise
   textinput.*     self-drawn text field (search, path bar, rename)
   gfx.cpp/.h      Direct2D/DirectWrite helpers + theme presets (shared with Foyer)
   config.cpp/.h   settings, pins, session (config.json)
@@ -84,7 +85,7 @@ res/              icon, manifest, version resource
 ```
 
 Coming in later phases: `queue.cpp` (transfer queue), `sizes.cpp` (background folder sizes),
-`search.cpp` (index + Everything), `preview.cpp`, `tags.cpp`, `settings.cpp`, `updater.cpp`
+`index.cpp` (Strata's own whole-PC index), `preview.cpp`, `tags.cpp`, `settings.cpp`, `updater.cpp`
 (shared with Foyer), `archive.cpp`, `git.cpp`.
 
 ## Roadmap

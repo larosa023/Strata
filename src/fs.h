@@ -61,5 +61,9 @@ bool IsDirectory(const std::wstring& path);
 std::vector<std::wstring> SplitPath(const std::wstring& path, std::vector<std::wstring>* fullPaths);
 std::vector<std::wstring> ListSubfolders(const std::wstring& folder, size_t max, bool includeHidden);
 int FolderIconIndex();
+void TypeAndIcon(const std::wstring& name, bool dir, std::wstring& typeName, int& icon);
+// Generation tracking shared by folder listings and searches (a newer request for a tab cancels older ones)
+void MarkLatest(int tab, uint64_t gen);
+bool Superseded(int tab, uint64_t gen);
 std::wstring FormatSize(uint64_t bytes);
 std::wstring FormatDate(const FILETIME& ft);

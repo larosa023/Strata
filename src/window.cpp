@@ -5,6 +5,8 @@
 #include "fs.h"
 #include "shell.h"
 #include "textinput.h"
+#include "search.h"
+#include <uxtheme.h>
 #include <windowsx.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -42,6 +44,11 @@ struct Tab {
     bool restoreScroll = false;
     std::wstring selectAfterLoad;            // select (and optionally rename) this name once listed
     bool renameAfterLoad = false;
+    // search (This PC: every drive; a folder: it and its subfolders)
+    bool searchActive = false, searchRunning = false, searchEverything = false, searchCapped = false;
+    std::wstring searchQuery;
+    uint64_t searchTotal = 0;
+    size_t searchScanned = 0;
 };
 
 enum class Focus { List, Search, Path, Rename };
@@ -111,13 +118,15 @@ static float g_W = 0, g_H = 0;
 
 // timers
 constexpr UINT_PTR TIMER_SCROLL = 1, TIMER_CARET = 2, TIMER_REFRESH = 3, TIMER_STATUS = 4, TIMER_DRIVES = 5,
-                   TIMER_MARQUEE = 6;
+                   TIMER_MARQUEE = 6, TIMER_SEARCH = 7;
 
 // metrics (DIPs)
 constexpr float kTitleH = 40, kToolH = 48, kStatusH = 28, kHeaderH = 32, kCapW = 46, kSplitW = 6, kResize = 6;
 static float RowH() { return g_config.density == L"compact" ? 26.0f : 32.0f; }
 
 static Tab& T() { return g_tabs[g_active]; }
+// The This PC page lists drives (unless it's showing search results)
+static bool DriveView(const Tab& t) { return t.path.empty() && !t.searchActive; }
 static float Px2Dip(int v) { return v / g_scale; }
 static void Redraw() { if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE); }
 
@@ -205,6 +214,10 @@ static void ApplyTheme() {
         DwmExtendFrameIntoClientArea(g_hwnd, &m);
     }
     ApplyMenuTheme(g_theme.dark);
+    // Our title bar is custom-drawn; stop Windows painting its own caption, icon and min/max/close
+    // buttons into the extended (Mica/acrylic) frame, which showed through as "ghost" buttons.
+    WTA_OPTIONS wta{WTNCA_NODRAWCAPTION | WTNCA_NODRAWICON | WTNCA_NOSYSMENU, WTNCA_NODRAWCAPTION | WTNCA_NODRAWICON | WTNCA_NOSYSMENU};
+    SetWindowThemeAttribute(g_hwnd, WTA_NONCLIENT, &wta, sizeof(wta));
     Redraw();
 }
 
@@ -240,12 +253,13 @@ static void BuildView(Tab& t) {
     for (int i = 0; i < (int)t.items.size(); ++i) {
         const Item& it = t.items[i];
         if (ItemHidden(it)) continue;
-        if (!f.empty() && !MatchesFilter(ToLower(it.name), f)) continue;
+        if (!t.searchActive && !f.empty() && !MatchesFilter(ToLower(it.name), f)) continue;
         t.view.push_back(i);
     }
     int col = g_config.sortColumn;
     bool desc = g_config.sortDescending;
-    bool thisPC = t.path.empty();
+    bool thisPC = DriveView(t);
+    bool search = t.searchActive;
     auto& items = t.items;
     auto& types = t.types;
     std::stable_sort(t.view.begin(), t.view.end(), [&](int ia, int ib) {
@@ -262,7 +276,9 @@ static void BuildView(Tab& t) {
         switch (col) {
             case ColSize: c = a.size < b.size ? -1 : a.size > b.size ? 1 : 0; break;
             case ColModified: c = CompareFileTime(&a.modified, &b.modified); break;
-            case ColType: c = StrCmpLogicalW(types[a.type].c_str(), types[b.type].c_str()); break;
+            case ColType:
+                c = search ? StrCmpLogicalW(a.path.c_str(), b.path.c_str()) : StrCmpLogicalW(types[a.type].c_str(), types[b.type].c_str());
+                break;
             default: break;
         }
         if (!c) c = StrCmpLogicalW(a.name.c_str(), b.name.c_str());
@@ -325,7 +341,10 @@ static void SelectRange(Tab& t, int a, int b, bool add) {
 // ============================================================ navigation
 static void WatchActive() { WatchFolder(g_hwnd, g_tabs.empty() ? L"" : T().path); }
 
+static void StartSearch(Tab& t, const std::wstring& query);
+
 static void Load(Tab& t, bool keepState) {
+    if (t.searchActive) { StartSearch(t, t.searchQuery); return; }
     t.gen = g_nextGen++;
     t.loading = true;
     if (keepState) {
@@ -358,6 +377,9 @@ static void Navigate(Tab& t, const std::wstring& path, bool addHistory = true, c
     t.error = 0;
     t.loaded = false;
     t.filter.SetText(L"");
+    t.searchActive = t.searchRunning = false;
+    t.searchQuery.clear();
+    if (&t == &T()) KillTimer(g_hwnd, TIMER_SEARCH);
     t.selectAfterLoad = selectName;
     t.renameAfterLoad = false;
     Load(t, false);
@@ -366,6 +388,44 @@ static void Navigate(Tab& t, const std::wstring& path, bool addHistory = true, c
         if (g_focus == Focus::Search || g_focus == Focus::Path || g_focus == Focus::Rename) g_focus = Focus::List;
     }
     Redraw();
+}
+
+static void StartSearch(Tab& t, const std::wstring& query) {
+    std::wstring q = query;
+    while (!q.empty() && q.back() == L' ') q.pop_back();
+    while (!q.empty() && q.front() == L' ') q.erase(q.begin());
+    if (q.empty()) return;
+    t.gen = g_nextGen++;
+    t.searchActive = t.searchRunning = true;
+    t.searchEverything = t.searchCapped = false;
+    t.searchQuery = q;
+    t.searchTotal = 0;
+    t.searchScanned = 0;
+    t.items.clear();
+    t.types.clear();
+    t.view.clear();
+    t.sel.clear();
+    t.focus = t.anchor = -1;
+    t.scroll = t.scrollTarget = 0;
+    t.error = 0;
+    t.loading = false;
+    t.loaded = true;
+    std::vector<std::wstring> roots;
+    if (!t.path.empty()) roots.push_back(t.path);
+    SearchAsync(g_hwnd, t.id, t.gen, roots, q);
+    Redraw();
+}
+
+static void EndSearch(Tab& t) {
+    KillTimer(g_hwnd, TIMER_SEARCH);
+    if (!t.searchActive) return;
+    t.searchActive = t.searchRunning = false;
+    t.searchQuery.clear();
+    t.items.clear();
+    t.view.clear();
+    t.sel.clear();
+    t.loaded = false;
+    Load(t, false);
 }
 
 // When going back/up to a parent, select the folder we came from.
@@ -506,7 +566,7 @@ static void CopyPathsToClipboard(const std::vector<std::wstring>& paths) {
 
 static void DoCopyCut(bool cut) {
     Tab& t = T();
-    if (t.path.empty()) return;
+    if (DriveView(t)) return;
     auto paths = SelectedPaths(t);
     if (paths.empty()) return;
     if (ClipboardSetFiles(g_hwnd, paths, cut))
@@ -534,7 +594,7 @@ static void DoPaste(const std::wstring& destFolder) {
 
 static void DoDelete(bool permanent) {
     Tab& t = T();
-    if (t.path.empty()) return;
+    if (DriveView(t)) return;
     auto paths = SelectedPaths(t);
     if (paths.empty()) return;
     FileOpAsync(g_hwnd, permanent ? OpKind::Delete : OpKind::Recycle, paths, L"");
@@ -544,7 +604,7 @@ static void SetFocusTo(Focus f);
 
 static void BeginRename() {
     Tab& t = T();
-    if (t.path.empty() || t.focus < 0 || t.focus >= (int)t.view.size()) return;
+    if (DriveView(t) || t.focus < 0 || t.focus >= (int)t.view.size()) return;
     int item = t.view[t.focus];
     if (!t.sel[item]) SelectOnly(t, t.focus);
     EnsureVisible(t, t.focus);
@@ -571,6 +631,7 @@ static void CommitRename(bool commit) {
             std::wstring oldPath = ItemPath(t, it);
             if (RenameItem(g_hwnd, oldPath, newName, &err)) {
                 t.items[g_renameItem].name = newName;
+                if (!t.items[g_renameItem].path.empty()) t.items[g_renameItem].path = PathJoin(PathParent(oldPath), newName);
                 t.restoreSel = {newName};
                 t.restoreFocus = newName;
                 BuildView(t);
@@ -891,7 +952,7 @@ static void PaintToolbar() {
                sFocus ? g_theme.accent : g_theme.subtext);
     D2D1_RECT_F stb = R(g_rcSearchBox.left + 32, g_rcSearchBox.top, g_rcSearchBox.right - 30, g_rcSearchBox.bottom);
     if (t.filter.text.empty() && !sFocus) {
-        g_cv.Text(L"Search " + TabTitle(t), g_fUi, stb, Alpha(g_theme.subtext, 0.8f));
+        g_cv.Text(t.path.empty() ? std::wstring(L"Search all drives") : L"Search " + TabTitle(t), g_fUi, stb, Alpha(g_theme.subtext, 0.8f));
         g_cv.Text(L"Ctrl+K", g_fSmallRight, R(stb.left, stb.top, g_rcSearchBox.right - 10, stb.bottom), Alpha(g_theme.subtext, 0.55f));
     } else {
         t.filter.Draw(g_cv, g_fInput, stb, g_theme.text, Alpha(g_theme.accent, 0.35f), g_theme.text, sFocus);
@@ -992,11 +1053,12 @@ static const wchar_t* kColLabel[ColCount] = {L"Name", L"Size", L"Modified", L"Ty
 static void ComputeColumns(float left) {
     g_cols.clear();
     float x = left;
-    bool thisPC = T().path.empty();
+    bool thisPC = DriveView(T());
     for (int c = 0; c < ColCount; ++c) {
         if (!g_config.columnVisible[c]) continue;
         float w = g_config.columnWidth[c];
         if (thisPC && c == ColModified) w = std::max(w, 200.0f);
+        if (T().searchActive && c == ColType) w = std::max(w, 360.0f);   // Location
         g_cols.push_back({c, x, x + w});
         x += w;
     }
@@ -1035,7 +1097,7 @@ static void PaintList() {
     g_rcList = R(left, top + kHeaderH, g_W, bottom);
     ClampScroll(t);
     ComputeColumns(left + 12);
-    bool thisPC = t.path.empty();
+    bool thisPC = DriveView(t);
 
     // header
     g_rt->PushAxisAlignedClip(g_rcHeader, D2D1_ANTIALIAS_MODE_ALIASED);
@@ -1047,6 +1109,7 @@ static void PaintList() {
         bool right = c.col == ColSize;
         const wchar_t* label = kColLabel[c.col];
         if (thisPC && c.col == ColModified) label = L"Space";
+        if (t.searchActive && c.col == ColType) label = L"Location";
         float tw = MeasureWidth(label, g_fHeader);
         D2D1_RECT_F tr = right ? R(r.right - 12 - tw, r.top, r.right - 12, r.bottom) : R(r.left + 10, r.top, r.right - 18, r.bottom);
         g_cv.Text(label, g_fHeader, tr, sorted ? g_theme.text : g_theme.subtext);
@@ -1068,7 +1131,16 @@ static void PaintList() {
     if (t.view.empty()) {
         std::wstring title, sub;
         wchar_t glyph = 0xE8B7;
-        if (t.loading && !t.loaded) {
+        if (t.searchActive && t.searchRunning) {
+            glyph = 0xE721;
+            title = L"Searching…";
+            sub = t.path.empty() ? L"Looking through every drive" : L"Looking through " + TabTitle(t) + L" and its subfolders";
+            if (t.searchScanned) sub += L" (" + WithCommas(t.searchScanned) + L" folders so far)";
+        } else if (t.searchActive) {
+            glyph = 0xE721;
+            title = L"No results";
+            sub = L"Nothing found for \"" + t.searchQuery + L"\"";
+        } else if (t.loading && !t.loaded) {
             title = L"Loading…";
         } else if (t.error) {
             glyph = 0xE783;
@@ -1077,7 +1149,7 @@ static void PaintList() {
         } else if (!t.filter.text.empty()) {
             glyph = 0xE721;
             title = L"No matches";
-            sub = L"Nothing in this folder matches \"" + t.filter.text + L"\"";
+            sub = L"Nothing in this folder matches \"" + t.filter.text + L"\" — press Enter to search subfolders";
         } else if (t.loaded) {
             title = L"This folder is empty";
             sub = L"Paste files here with Ctrl+V, or right-click for New";
@@ -1147,7 +1219,8 @@ static void PaintList() {
                     }
                     break;
                 case ColType:
-                    g_cv.Text(t.types[it.type], g_fUi, cell, sc);
+                    if (t.searchActive) g_cv.Text(PathParent(it.path), g_fUi, cell, sc);
+                    else g_cv.Text(t.types[it.type], g_fUi, cell, sc);
                     break;
             }
         }
@@ -1182,8 +1255,16 @@ static void PaintStatus() {
         left = g_statusMsg;
     } else {
         size_t total = t.view.size();
-        left = WithCommas(total) + (total == 1 ? L" item" : L" items");
-        if (!t.filter.text.empty()) left += L" match";
+        left = WithCommas(total) + (t.searchActive ? (total == 1 ? L" result" : L" results") : (total == 1 ? L" item" : L" items"));
+        if (t.searchActive) {
+            if (t.searchRunning) left += L"   ·   searching" + (t.searchScanned ? L" (" + WithCommas(t.searchScanned) + L" folders)" : std::wstring()) + L"…";
+            else if (t.searchCapped && t.searchEverything && t.searchTotal) left += L"   ·   first " + WithCommas(total) + L" of " + WithCommas(t.searchTotal);
+            else if (t.searchCapped) left += L"   ·   stopped at " + WithCommas(kSearchMaxResults) + L" — be more specific";
+            if (t.searchEverything) left += L"   ·   via Everything";
+            else if (!t.searchRunning && t.path.empty()) left += L"   ·   tip: install Everything for instant whole-PC search";
+        } else if (!t.filter.text.empty() && !t.path.empty()) {
+            left += L" match   ·   Enter searches subfolders";
+        }
         int n = 0;
         uint64_t bytes = 0;
         bool anyDir = false;
@@ -1429,13 +1510,23 @@ static void OverflowMenu(POINT pt) {
     }
 }
 
-enum ItemCmd { IC_OpenTab = 1, IC_Pin, IC_CopyPath, IC_Terminal, IC_NewFolder, IC_NewText, IC_Paste, IC_Refresh, IC_Props,
+enum ItemCmd { IC_OpenLocation = 20, IC_OpenTab = 1, IC_Pin, IC_CopyPath, IC_Terminal, IC_NewFolder, IC_NewText, IC_Paste, IC_Refresh, IC_Props,
                IC_SelectAll, IC_OpenWith };
 
 static void ListContextMenu(POINT screenPt, bool onItem) {
     Tab& t = T();
     std::vector<std::wstring> paths = onItem ? SelectedPaths(t) : std::vector<std::wstring>{};
     std::vector<MenuEntry> extra;
+    if (onItem && !paths.empty() && t.searchActive) {
+        // Search results can come from many folders; the Windows menu works on items that share a folder
+        std::wstring parent = PathParent(paths[0]);
+        if (t.focus >= 0 && t.focus < (int)t.view.size()) parent = PathParent(t.items[t.view[t.focus]].path);
+        std::vector<std::wstring> same;
+        for (auto& p : paths) if (_wcsicmp(PathParent(p).c_str(), parent.c_str()) == 0) same.push_back(p);
+        if (same.size() != paths.size()) SetStatus(L"The menu applies to the selected items in " + PathLeaf(parent));
+        paths = same;
+        extra.push_back({IC_OpenLocation, L"Open file location"});
+    }
     if (onItem && !paths.empty()) {
         bool singleDir = false;
         if (paths.size() == 1 && t.focus >= 0 && t.focus < (int)t.view.size()) singleDir = IsDirectory(paths[0]);
@@ -1457,6 +1548,7 @@ static void ListContextMenu(POINT screenPt, bool onItem) {
             return false;
         });
         switch (result) {
+            case IC_OpenLocation: Navigate(T(), PathParent(paths[0]), true, PathLeaf(paths[0])); break;
             case IC_OpenTab: OpenFolderInNewTab(paths[0], true); break;
             case IC_Pin: TogglePin(paths[0]); break;
             case IC_Terminal: OpenTerminal(paths[0]); break;
@@ -1522,6 +1614,14 @@ static void FocusSearch() {
 
 static void OnFilterChanged() {
     Tab& t = T();
+    bool empty = t.filter.text.find_first_not_of(L' ') == std::wstring::npos;
+    if (t.path.empty() || t.searchActive) {
+        // This PC searches every drive; an active subfolder search follows the text too
+        if (empty) EndSearch(t);
+        else SetTimer(g_hwnd, TIMER_SEARCH, t.path.empty() ? 250 : 350, nullptr);
+        Redraw();
+        return;
+    }
     BuildView(t);
     t.scroll = t.scrollTarget = 0;
     if (!t.view.empty() && !t.filter.text.empty()) { t.focus = 0; }
@@ -1622,6 +1722,12 @@ static bool OnInputKey(UINT vk) {
         else if (g_focus == Focus::Rename) CommitRename(true);
         else {
             Tab& t = T();
+            bool hasText = t.filter.text.find_first_not_of(L' ') != std::wstring::npos;
+            bool pending = KillTimer(g_hwnd, TIMER_SEARCH) != FALSE;
+            if (hasText && !ctrl && (pending || (!t.searchActive && !t.path.empty()))) {
+                StartSearch(t, t.filter.text);   // search now (in a folder: include subfolders)
+                return true;
+            }
             SetFocusTo(Focus::List);
             if (!t.view.empty()) { if (t.focus < 0) t.focus = 0; SelectOnly(t, t.focus); if (ctrl) OpenSelection(t, false); }
         }
@@ -2091,6 +2197,36 @@ static void OnListing(Listing* L) {
     Redraw();
 }
 
+static void OnSearch(SearchBatch* b) {
+    for (auto& t : g_tabs) {
+        if (t.id != b->tab || t.gen != b->gen || !t.searchActive) continue;
+        std::map<std::wstring, int> idx;
+        for (int i = 0; i < (int)t.types.size(); ++i) idx[t.types[i]] = i;
+        std::vector<int> remap(b->typeNames.size());
+        for (size_t i = 0; i < b->typeNames.size(); ++i) {
+            auto it = idx.find(b->typeNames[i]);
+            if (it == idx.end()) { remap[i] = (int)t.types.size(); t.types.push_back(b->typeNames[i]); }
+            else remap[i] = it->second;
+        }
+        for (auto& it : b->items) {
+            it.type = remap[it.type];
+            t.items.push_back(std::move(it));
+        }
+        t.sel.resize(t.items.size(), 0);
+        if (b->done) t.searchRunning = false;
+        t.searchEverything = b->everything;
+        t.searchCapped = b->capped;
+        t.searchTotal = b->total;
+        t.searchScanned = b->scannedFolders;
+        BuildView(t);
+        if (t.focus < 0 && !t.view.empty()) t.focus = 0;
+        ClampScroll(t);
+        break;
+    }
+    delete b;
+    Redraw();
+}
+
 static void OnIcons(IconBatch* b) {
     for (auto& t : g_tabs) {
         if (t.id != b->tab || t.gen != b->gen) continue;
@@ -2120,9 +2256,21 @@ static void OnOpDone(OpResult* r) {
                               r->kind == OpKind::Recycle ? L"Moved to Recycle Bin: " : L"Deleted ";
         SetStatus(what + std::to_wstring(r->sources.size()) + (r->sources.size() == 1 ? L" item" : L" items"));
     }
-    delete r;
     Tab& t = T();
-    if (!t.path.empty()) Load(t, true);
+    if (t.searchActive) {
+        if (r->ok && r->kind != OpKind::Copy) {
+            std::set<std::wstring> gone;
+            for (auto& s : r->sources) gone.insert(ToLower(s));
+            std::vector<Item> keep;
+            for (auto& it : t.items) if (!gone.count(ToLower(it.path))) keep.push_back(std::move(it));
+            t.items = std::move(keep);
+            t.sel.assign(t.items.size(), 0);
+            BuildView(t);
+        }
+    } else if (!t.path.empty()) {
+        Load(t, true);
+    }
+    delete r;
     ListDrivesAsync(g_hwnd);   // free space changed
 }
 
@@ -2334,7 +2482,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 case TIMER_REFRESH:
                     KillTimer(hwnd, TIMER_REFRESH);
-                    if (!g_tabs.empty() && g_focus != Focus::Rename) Load(T(), true);
+                    if (!g_tabs.empty() && g_focus != Focus::Rename && !T().searchActive) Load(T(), true);
+                    return 0;
+                case TIMER_SEARCH:
+                    KillTimer(hwnd, TIMER_SEARCH);
+                    if (!g_tabs.empty()) StartSearch(T(), T().filter.text);
                     return 0;
                 case TIMER_STATUS:
                     KillTimer(hwnd, TIMER_STATUS);
@@ -2368,6 +2520,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_STRATA_ICONS: OnIcons(reinterpret_cast<IconBatch*>(lp)); return 0;
         case WM_STRATA_DRIVES: OnDrives(reinterpret_cast<std::vector<DriveInfo>*>(lp)); return 0;
         case WM_STRATA_OPDONE: OnOpDone(reinterpret_cast<OpResult*>(lp)); return 0;
+        case WM_STRATA_SEARCH: OnSearch(reinterpret_cast<SearchBatch*>(lp)); return 0;
         case WM_STRATA_DIRCHANGED:
             if ((uint64_t)wp == WatchGeneration()) SetTimer(hwnd, TIMER_REFRESH, 350, nullptr);
             return 0;
@@ -2382,6 +2535,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case WM_COPYDATA: {
             auto* cds = reinterpret_cast<COPYDATASTRUCT*>(lp);
+            if (SearchHandleCopyData(hwnd, cds)) return TRUE;
             if (cds && cds->dwData == 0x5354 /*'ST'*/) {
                 std::wstring path(reinterpret_cast<const wchar_t*>(cds->lpData), cds->cbData / sizeof(wchar_t));
                 while (!path.empty() && path.back() == 0) path.pop_back();

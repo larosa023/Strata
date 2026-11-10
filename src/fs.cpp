@@ -141,6 +141,9 @@ std::wstring FormatDate(const FILETIME& ft) {
     return std::wstring(d) + L"  " + t;
 }
 
+static std::wstring ExtLower(const std::wstring& name);
+static std::wstring ExtLowerOf(const std::wstring& name) { return ExtLower(name); }
+
 // ---------------------------------------------------------------- type + icon cache
 struct TypeInfo { std::wstring name; int icon = -1; };
 static std::mutex g_typeLock;
@@ -172,6 +175,15 @@ static TypeInfo LookupType(const std::wstring& extLower, bool dir) {
 }
 
 int FolderIconIndex() { return LookupType(L"", true).icon; }
+
+void TypeAndIcon(const std::wstring& name, bool dir, std::wstring& typeName, int& icon) {
+    TypeInfo ti = LookupType(dir ? L"" : ExtLowerOf(name), dir);
+    typeName = ti.name;
+    icon = ti.icon;
+}
+
+bool Superseded(int tab, uint64_t gen);
+void MarkLatest(int tab, uint64_t gen);
 
 static bool NeedsRealIcon(const std::wstring& extLower, DWORD attrs) {
     if (attrs & FILE_ATTRIBUTE_DIRECTORY) return (attrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM)) != 0;  // desktop.ini folders
@@ -252,7 +264,12 @@ void ListDrivesAsync(HWND notify) {
 static std::mutex g_genLock;
 static std::map<int, uint64_t> g_latestGen;   // tab -> latest requested generation
 
-static bool Superseded(int tab, uint64_t gen) {
+void MarkLatest(int tab, uint64_t gen) {
+    std::lock_guard<std::mutex> lock(g_genLock);
+    g_latestGen[tab] = gen;
+}
+
+bool Superseded(int tab, uint64_t gen) {
     std::lock_guard<std::mutex> lock(g_genLock);
     auto it = g_latestGen.find(tab);
     return it != g_latestGen.end() && it->second != gen;

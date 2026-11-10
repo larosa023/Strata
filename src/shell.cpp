@@ -242,8 +242,25 @@ static UINT DropEffectFormat() {
     return cf;
 }
 
+// Data object for items that may live in different folders (e.g. search results)
+static IDataObject* DataObjectForPaths(HWND owner, const std::vector<std::wstring>& paths) {
+    bool sameParent = true;
+    for (auto& p : paths) if (_wcsicmp(PathParent(p).c_str(), PathParent(paths[0]).c_str()) != 0) sameParent = false;
+    if (sameParent) return GetUIObject<IDataObject>(owner, paths, IID_IDataObject);
+    std::vector<PIDLIST_ABSOLUTE> abs;
+    for (auto& p : paths) {
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (SUCCEEDED(SHParseDisplayName(p.c_str(), nullptr, &pidl, 0, nullptr)) && pidl) abs.push_back(pidl);
+    }
+    IDataObject* data = nullptr;
+    if (!abs.empty())
+        SHCreateDataObject(nullptr, (UINT)abs.size(), (PCUITEMID_CHILD_ARRAY)abs.data(), nullptr, IID_PPV_ARGS(&data));
+    for (auto p : abs) CoTaskMemFree(p);
+    return data;
+}
+
 bool ClipboardSetFiles(HWND owner, const std::vector<std::wstring>& paths, bool cut) {
-    IDataObject* data = GetUIObject<IDataObject>(owner, paths, IID_IDataObject);
+    IDataObject* data = DataObjectForPaths(owner, paths);
     if (!data) return false;
     HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
     if (g) {

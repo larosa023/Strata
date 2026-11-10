@@ -15,5 +15,5 @@ if(MSVC)
   target_compile_options(Strata PRIVATE /W4 /utf-8 /permissive-)
   target_link_options(Strata PRIVATE /MANIFEST:NO)   # manifest comes from strata.rc
 endif()
-target_link_libraries(Strata PRIVATE d2d1 dwrite ole32 oleaut32 uuid dwmapi shcore shell32 user32 gdi32 advapi32 shlwapi windowscodecs comctl32 mpr)
+target_link_libraries(Strata PRIVATE d2d1 dwrite ole32 oleaut32 uuid dwmapi shcore shell32 user32 gdi32 advapi32 shlwapi windowscodecs comctl32 mpr uxtheme)
 set_target_properties(Strata PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/dist)
