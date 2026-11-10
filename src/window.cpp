@@ -17,6 +17,11 @@
 #include "index.h"
 #include "query.h"
 #include "batch.h"
+#include "dialogs.h"
+#include "visits.h"
+#include "versions.h"
+#include "treemap.h"
+#include <mmsystem.h>
 #include <unordered_map>
 #include <list>
 #include <uxtheme.h>
@@ -31,6 +36,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <ctime>
 
 using namespace gfx;
 
@@ -39,7 +45,7 @@ namespace {  // file-local type (keeps it from clashing with same-named types in
 struct ColGeom { int col; float left, right; };
 }  // namespace
 namespace {  // file-local type (keeps it from clashing with same-named types in other files)
-enum ViewMode { ViewList = 0, ViewGrid = 1 };
+enum ViewMode { ViewList = 0, ViewGrid = 1, ViewSpace = 2 };
 }  // namespace
 
 namespace {  // file-local type (keeps it from clashing with same-named types in other files)
@@ -77,6 +83,17 @@ struct Pane {
     int sortColumn = ColName;
     bool sortDescending = false;
     uint64_t maxSize = 0;                    // biggest item (for size bars)
+    // focus filter (Ctrl+Shift+F): show only PDFs / images / changed this week … (kept while browsing)
+    std::wstring focusFilter, focusLabel;
+    // version stacks: Plans_rev1/rev2/rev3 shown as one row (per item: >1 head with N versions, -1 hidden/child, 0 none)
+    std::vector<int> stackCount;
+    std::unordered_map<int, std::vector<int>> stackMembers;   // head item -> versions (newest first, head included)
+    std::unordered_map<int, std::wstring> stackKeys;          // head item -> group key
+    std::set<std::wstring> openStacks;                        // expanded groups
+    std::wstring changedLabel;               // "What changed" results: "since my last visit" …
+    bool spaceSticky = false;                // Space view follows you into subfolders
+    std::vector<D2D1_RECT_F> spaceRects;     // Space view tiles, per view position
+    DWORD shownAt = 0;                       // when a newly opened folder appeared (fade-in)
     // geometry from the last paint (DIPs)
     D2D1_RECT_F rcPane{}, rcList{}, rcHeader{};
     std::vector<ColGeom> cols;
@@ -91,11 +108,14 @@ struct Tab {
     int id = 0;
     Pane pane[2];
     int active = 0;                          // which pane has focus
+    bool locked = false;                     // stays on its folders: navigating opens a new tab
+    uint32_t color = 0;                      // tab color (0 = none)
+    DWORD born = 0;                          // for the open animation
 };
 }  // namespace
 
 namespace {  // file-local type (keeps it from clashing with same-named types in other files)
-enum class Focus { List, Search, Path, Rename };
+enum class Focus { List, Search, Path, Rename, Jump };
 }  // namespace
 
 namespace {  // file-local type (keeps it from clashing with same-named types in other files)
@@ -103,7 +123,8 @@ enum ZoneKind {
     ZNone, ZTab, ZTabClose, ZNewTab, ZCapMin, ZCapMax, ZCapClose, ZBack, ZFwd, ZUp, ZRefresh, ZPathBox, ZCrumb, ZCrumbArrow,
     ZCrumbOverflow, ZSearch, ZSearchClear, ZMenu, ZSideThisPC, ZSidePin, ZSideDrive, ZSideSplitter, ZHeader, ZHeaderDiv,
     ZList, ZScrollbar, ZPaneSplitter, ZPreviewSplitter, ZViewSwitch, ZUpdatePill, ZQueueStatus, ZQueueJobPause, ZQueueJobCancel,
-    ZQueueClear, ZQueueClose, ZPreviewButton, ZSideTag, ZSideSaved, ZSideRecent, ZSideSection, ZPreviewToggle
+    ZQueueClear, ZQueueClose, ZPreviewButton, ZSideTag, ZSideSaved, ZSideRecent, ZSideSection, ZPreviewToggle,
+    ZStack, ZFocusChip, ZFocusClear, ZJumpItem, ZQlPrev, ZQlNext, ZQlClose, ZQlOpen, ZOverlay, ZToast, ZToastAction, ZToastClose
 };
 }  // namespace
 namespace {  // file-local type (keeps it from clashing with same-named types in other files)
@@ -194,6 +215,83 @@ static bool DriveView(const Pane& t) { return t.path.empty() && !t.searchActive;
 static float Px2Dip(int v) { return v / g_scale; }
 static void Redraw() { if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE); }
 
+// ============================================================ animation
+// Small eased transitions (panels, tabs, the active pane, overlays, newly opened folders).
+// Settings > Layout > Animations: none / fast / smooth; Windows' "Animation effects" off turns them off too.
+constexpr UINT_PTR TIMER_ANIM = 14;
+static DWORD g_animUntil = 0;
+static float AnimScale() {
+    if (g_config.animation == L"none") return 0;
+    static DWORD checked = 0;
+    static BOOL sys = TRUE;
+    if (!checked || GetTickCount() - checked > 5000) { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &sys, 0); checked = GetTickCount(); }
+    if (!sys) return 0;
+    return g_config.animation == L"fast" ? 0.6f : 1.0f;
+}
+static float Ease(float t) { t = std::clamp(t, 0.0f, 1.0f); float u = 1 - t; return 1 - u * u * u; }
+static void AnimKick(float ms) {
+    if (ms <= 0 || !g_hwnd) return;
+    DWORD until = GetTickCount() + (DWORD)ms + 20;
+    if ((int)(until - g_animUntil) > 0) {
+        g_animUntil = until;
+        SetTimer(g_hwnd, TIMER_ANIM, 10, nullptr);
+    }
+}
+namespace {
+struct Anim {
+    float from = 0, to = 0, dur = 0;
+    DWORD start = 0;
+    bool init = false;
+    float Value() const {
+        if (dur <= 0) return to;
+        float k = (GetTickCount() - start) / dur;
+        return k >= 1 ? to : from + (to - from) * Ease(k);
+    }
+    void Target(float v, float ms) {
+        if (!init) { from = to = v; init = true; dur = 0; return; }
+        if (v == to) return;
+        from = Value();
+        to = v;
+        start = GetTickCount();
+        dur = ms * AnimScale();
+        AnimKick(dur);
+    }
+    void Jump(float v) { from = to = v; dur = 0; init = true; }
+};
+}  // namespace
+// 0..1 progress of something that began at t0 and lasts ms (1 when animations are off or t0 is 0)
+static float Since(DWORD t0, float ms) {
+    float d = ms * AnimScale();
+    if (!t0 || d <= 0) return 1;
+    float el = (float)(GetTickCount() - t0);
+    if (el >= d) return 1;
+    AnimKick(d - el);
+    return Ease(el / d);
+}
+static Anim g_aSidebar, g_aPreview, g_aTab, g_aPaneBar;
+
+// ============================================================ overlay state
+// Quick look (Space): a big preview you flip through with the arrow keys
+namespace {
+struct QuickLook { bool open = false; DWORD openedAt = 0; };
+struct JumpState {   // Jump to folder (Ctrl+G)
+    bool open = false;
+    DWORD openedAt = 0;
+    TextInput input;
+    std::vector<JumpHit> hits;
+    int sel = 0;
+};
+struct Toast { int id = 0; std::wstring title, body, folder; bool problem = false; DWORD born = 0; };
+}  // namespace
+static QuickLook g_ql;
+static JumpState g_jump;
+static std::vector<Toast> g_toasts;
+static int g_toastNext = 1;
+static std::wstring g_trayToastFolder;
+static size_t g_overlayZoneStart = (size_t)-1;   // zones from here on belong to an open overlay
+constexpr UINT_PTR TIMER_TOAST = 15;
+constexpr DWORD kToastLife = 7000;
+
 // forward declarations (features defined further down)
 static void TogglePreview();
 static void ToggleDual();
@@ -207,6 +305,8 @@ static void OpenSettings(int page);
 static void PreviewScroll(int delta);
 static void PreviewRefresh(bool force);
 static void OnUpdateStatus();
+static float SidebarW();
+static float PreviewW();
 static bool g_manualUpdateCheck = false;
 
 static void SetStatus(const std::wstring& msg) {
@@ -270,7 +370,22 @@ static void CreateFormats() {
 
 static void ThumbsDiscard();
 static void PreviewBitmapsDiscard();
+static std::vector<ID2D1Layer*> g_layers;   // one per nesting level
+static int g_layerDepth = 0;
+static void PushFade(const D2D1_RECT_F& r, float opacity) {
+    if (g_layerDepth >= (int)g_layers.size()) {
+        ID2D1Layer* l = nullptr;
+        g_rt->CreateLayer(&l);
+        g_layers.push_back(l);
+    }
+    ID2D1Layer* l = g_layers[g_layerDepth++];
+    g_rt->PushLayer(D2D1::LayerParameters(r, nullptr, D2D1_ANTIALIAS_MODE_ALIASED, D2D1::IdentityMatrix(), std::clamp(opacity, 0.0f, 1.0f)), l);
+}
+static void PopFade() { g_rt->PopLayer(); --g_layerDepth; }
 static void DiscardDevice() {
+    for (auto* l : g_layers) if (l) l->Release();
+    g_layers.clear();
+    g_layerDepth = 0;
     IconsDiscard();
     ThumbsDiscard();
     PreviewBitmapsDiscard();
@@ -343,10 +458,19 @@ static void BuildView(Pane& t) {
     t.view.clear();
     std::wstring f = ToLower(t.filter.text);
     while (!f.empty() && f.back() == L' ') f.pop_back();
+    bool focusOn = !t.focusFilter.empty() && !DriveView(t);
+    SearchQuery fq = focusOn ? ParseQuery(t.focusFilter) : SearchQuery{};
     for (int i = 0; i < (int)t.items.size(); ++i) {
         const Item& it = t.items[i];
         if (ItemHidden(it)) continue;
         if (!t.searchActive && !f.empty() && !MatchesFilter(ToLower(it.name), f)) continue;
+        if (focusOn) {
+            if (!fq.Match(ToLower(it.name), it.isDir(), it.size, it.modified)) continue;
+            if (!fq.tag.empty()) {
+                const TagDef* d = TagDefById(TagOf(ItemPath(t, it)));
+                if (!d || (_wcsicmp(d->name.c_str(), fq.tag.c_str()) != 0 && _wcsicmp(d->id.c_str(), fq.tag.c_str()) != 0)) continue;
+            }
+        }
         t.view.push_back(i);
     }
     int col = t.sortColumn;
@@ -369,9 +493,15 @@ static void BuildView(Pane& t) {
         if (!thisPC) maxSize = std::max(maxSize, v);
     }
     t.maxSize = maxSize;
+    bool space = t.viewMode == ViewSpace;
     std::stable_sort(t.view.begin(), t.view.end(), [&](int ia, int ib) {
         const Item& a = items[ia];
         const Item& b = items[ib];
+        if (space) {   // Space view: biggest first
+            uint64_t sa = thisPC ? a.total : eff[ia], sb = thisPC ? b.total : eff[ib];
+            if (sa != sb) return sa > sb;
+            return StrCmpLogicalW(a.name.c_str(), b.name.c_str()) < 0;
+        }
         if (thisPC) {
             int c = 0;
             if (col == ColSize) c = a.total < b.total ? -1 : a.total > b.total ? 1 : 0;
@@ -391,6 +521,46 @@ static void BuildView(Pane& t) {
         if (!c) c = StrCmpLogicalW(a.name.c_str(), b.name.c_str());
         return desc ? c > 0 : c < 0;
     });
+    // version stacks: keep the newest version of each group, the rest appear under it when expanded
+    t.stackCount.assign(t.items.size(), 0);
+    t.stackMembers.clear();
+    t.stackKeys.clear();
+    if (g_config.stackVersions && !thisPC && !space && !search && t.archive.empty()) {
+        std::unordered_map<std::wstring, std::vector<int>> groups;
+        std::vector<VersionKey> keys(items.size());
+        for (int i : t.view) {
+            if (items[i].isDir()) continue;
+            keys[i] = ParseVersion(items[i].name, false);
+            groups[keys[i].key].push_back(i);
+        }
+        for (auto& g : groups) {
+            if (g.second.size() < 2) continue;
+            bool anyMarker = false;
+            for (int i : g.second) anyMarker |= keys[i].marker;
+            if (!anyMarker) continue;
+            std::vector<int> m = g.second;
+            std::stable_sort(m.begin(), m.end(), [&](int a, int b) {
+                bool da = keys[a].rank >= 19000000, db = keys[b].rank >= 19000000;   // a date vs a revision number: newest file wins
+                if (da == db && keys[a].rank != keys[b].rank) return keys[a].rank > keys[b].rank;
+                return CompareFileTime(&items[a].modified, &items[b].modified) > 0;
+            });
+            t.stackCount[m[0]] = (int)m.size();
+            for (size_t k = 1; k < m.size(); ++k) t.stackCount[m[k]] = -1;
+            t.stackMembers[m[0]] = m;
+            t.stackKeys[m[0]] = g.first;
+        }
+        if (!t.stackMembers.empty()) {
+            std::vector<int> v2;
+            v2.reserve(t.view.size());
+            for (int i : t.view) {
+                if (t.stackCount[i] < 0) continue;
+                v2.push_back(i);
+                if (t.stackCount[i] > 1 && t.openStacks.count(t.stackKeys[i]))
+                    for (size_t k = 1; k < t.stackMembers[i].size(); ++k) v2.push_back(t.stackMembers[i][k]);
+            }
+            t.view.swap(v2);
+        }
+    }
     if (t.sel.size() != t.items.size()) t.sel.assign(t.items.size(), 0);
     // deselect items that are no longer visible
     std::vector<uint8_t> visible(t.items.size(), 0);
@@ -411,7 +581,7 @@ static int RowsOf(const Pane& t) {
     int c = std::max(1, t.gridCols);
     return ((int)t.view.size() + c - 1) / c;
 }
-static float ContentH(const Pane& t) { return RowsOf(t) * ItemRowH(t) + 8; }
+static float ContentH(const Pane& t) { return t.viewMode == ViewSpace ? 0.0f : RowsOf(t) * ItemRowH(t) + 8; }
 static float MaxScroll(const Pane& t) { return std::max(0.0f, ContentH(t) - ListViewH(t)); }
 
 static void ClampScroll(Pane& t) {
@@ -421,7 +591,7 @@ static void ClampScroll(Pane& t) {
 }
 
 static void EnsureVisible(Pane& t, int v) {
-    if (v < 0) return;
+    if (v < 0 || t.viewMode == ViewSpace) return;
     float rh = ItemRowH(t), y = (t.viewMode == ViewGrid ? v / std::max(1, t.gridCols) : v) * rh, h = ListViewH(t);
     if (y < t.scrollTarget) t.scrollTarget = y;
     else if (y + rh > t.scrollTarget + h) t.scrollTarget = y + rh - h + 4;
@@ -474,16 +644,17 @@ static void ApplyFolderView(Pane& t) {
     if (g_config.rememberFolderViews && !t.path.empty() && FolderViewGet(t.path, v)) {
         t.sortColumn = v.sortColumn;
         t.sortDescending = v.sortDescending;
-        t.viewMode = v.viewMode;
+        t.viewMode = v.viewMode == ViewSpace ? ViewList : v.viewMode;
     } else {
         t.sortColumn = g_config.sortColumn;
         t.sortDescending = g_config.sortDescending;
         t.viewMode = ViewList;
     }
+    if (t.spaceSticky) t.viewMode = ViewSpace;
 }
 
 static void SaveFolderView(const Pane& t) {
-    if (!g_config.rememberFolderViews || t.path.empty() || t.searchActive || !t.tagFilter.empty()) return;
+    if (!g_config.rememberFolderViews || t.path.empty() || t.searchActive || !t.tagFilter.empty() || t.viewMode == ViewSpace) return;
     FolderViewSet(t.path, {t.sortColumn, t.sortDescending, t.viewMode});
 }
 
@@ -507,7 +678,34 @@ static void Load(Pane& t, bool keepState) {
     ListFolderAsync(g_hwnd, t.id, t.gen, t.path);
 }
 
+static int AddTab(const std::wstring& left, bool activate, int insertAt, const std::wstring* right, int activePane);
+// Recent folders + visit history (for Jump to folder and "since my last visit")
+static void NoteFolderOpened(const std::wstring& p) {
+    if (p.empty()) return;
+    auto& rec = g_config.recentFolders;
+    rec.erase(std::remove_if(rec.begin(), rec.end(), [&](const std::wstring& r) { return _wcsicmp(r.c_str(), p.c_str()) == 0; }), rec.end());
+    rec.insert(rec.begin(), p);
+    if (rec.size() > 12) rec.resize(12);
+    if (ArchiveOf(p).empty()) VisitRecord(p);
+}
+static int TabIndexOf(const Pane& p) {
+    for (int i = 0; i < (int)g_tabs.size(); ++i)
+        if (&g_tabs[i].pane[0] == &p || &g_tabs[i].pane[1] == &p) return i;
+    return -1;
+}
+// A locked tab stays on its folder: going somewhere else opens a new tab next to it instead.
+static bool LockedRedirect(Pane& t, const std::wstring& path) {
+    int ti = TabIndexOf(t);
+    if (ti < 0 || !g_tabs[ti].locked) return false;
+    std::wstring p = NormalizeFolder(path);
+    if (_wcsicmp(p.c_str(), t.path.c_str()) == 0) return false;
+    AddTab(p, true, ti + 1, nullptr, 0);
+    SetStatus(L"This tab is locked, so the folder opened in a new tab");
+    return true;
+}
+
 static void Navigate(Pane& t, const std::wstring& path, bool addHistory = true, const std::wstring& selectName = L"") {
+    if (LockedRedirect(t, path)) return;
     std::wstring p = NormalizeFolder(path);
     if (addHistory && _wcsicmp(p.c_str(), t.path.c_str()) != 0) {
         t.back.push_back(t.path);
@@ -527,16 +725,13 @@ static void Navigate(Pane& t, const std::wstring& path, bool addHistory = true, 
     t.searchActive = t.searchRunning = false;
     t.searchQuery.clear();
     t.tagFilter.clear();
+    t.changedLabel.clear();
+    t.openStacks.clear();
     if (&t == &T()) KillTimer(g_hwnd, TIMER_SEARCH);
     t.selectAfterLoad = selectName;
     t.renameAfterLoad = false;
     ApplyFolderView(t);
-    if (!p.empty()) {
-        auto& rec = g_config.recentFolders;
-        rec.erase(std::remove_if(rec.begin(), rec.end(), [&](const std::wstring& r) { return _wcsicmp(r.c_str(), p.c_str()) == 0; }), rec.end());
-        rec.insert(rec.begin(), p);
-        if (rec.size() > 12) rec.resize(12);
-    }
+    NoteFolderOpened(p);
     Load(t, false);
     WatchActive();
     if (&t == &T() && (g_focus == Focus::Search || g_focus == Focus::Path || g_focus == Focus::Rename)) g_focus = Focus::List;
@@ -615,6 +810,7 @@ static void EndSearch(Pane& t) {
     if (!t.searchActive) return;
     t.searchActive = t.searchRunning = false;
     t.searchQuery.clear();
+    if (!t.changedLabel.empty()) { t.changedLabel.clear(); ApplyFolderView(t); }
     t.items.clear();
     t.view.clear();
     t.sel.clear();
@@ -630,6 +826,7 @@ static std::wstring ChildMarker(const std::wstring& parent, const std::wstring& 
 
 static void GoBack(Pane& t) {
     if (t.back.empty()) return;
+    if (LockedRedirect(t, t.back.back())) return;
     std::wstring from = t.path;
     std::wstring to = t.back.back();
     t.back.pop_back();
@@ -639,6 +836,7 @@ static void GoBack(Pane& t) {
 
 static void GoForward(Pane& t) {
     if (t.fwd.empty()) return;
+    if (LockedRedirect(t, t.fwd.back())) return;
     std::wstring to = t.fwd.back();
     t.fwd.pop_back();
     t.back.push_back(t.path);
@@ -663,11 +861,13 @@ static int AddTab(const std::wstring& left, bool activate, int insertAt = -1, co
     t.pane[0].path = NormalizeFolder(left);
     t.pane[1].path = NormalizeFolder(right ? *right : left);
     t.active = activePane & 1;
+    t.born = GetTickCount();
     if (insertAt < 0 || insertAt > (int)g_tabs.size()) insertAt = (int)g_tabs.size();
     g_tabs.insert(g_tabs.begin() + insertAt, std::move(t));
     if (activate) g_active = insertAt;
     else if (insertAt <= g_active && g_tabs.size() > 1) ++g_active;
     for (auto& p : g_tabs[insertAt].pane) { ApplyFolderView(p); Load(p, false); }
+    if (activate) NoteFolderOpened(g_tabs[insertAt].pane[g_tabs[insertAt].active].path);
     if (activate) {
         WatchActive();
         g_focus = Focus::List;
@@ -696,10 +896,11 @@ static void SetActivePane(int i) {
     Redraw();
 }
 
-static SessionTab TabState(const Tab& t) { return {t.pane[0].path, t.pane[1].path, t.active}; }
+static SessionTab TabState(const Tab& t) { return {t.pane[0].path, t.pane[1].path, t.active, t.locked, t.color}; }
 
 static void CloseTab(int i) {
     if (i < 0 || i >= (int)g_tabs.size()) return;
+    if (g_tabs[i].locked) { SetStatus(L"This tab is locked: right-click it → Unlock tab to close it"); return; }
     g_closedTabs.push_back(TabState(g_tabs[i]));
     if (g_closedTabs.size() > 25) g_closedTabs.erase(g_closedTabs.begin());
     if (g_tabs.size() == 1) { PostMessageW(g_hwnd, WM_CLOSE, 0, 0); return; }
@@ -712,12 +913,14 @@ static void ReopenClosedTab() {
     if (g_closedTabs.empty()) return;
     SessionTab st = g_closedTabs.back();
     g_closedTabs.pop_back();
-    AddTab(st.left, true, g_active + 1, &st.right, st.activePane);
+    int at = AddTab(st.left, true, g_active + 1, &st.right, st.activePane);
+    g_tabs[at].color = st.color;
 }
 
 static std::wstring PaneTitle(const Pane& t);
 
 static std::wstring PaneTitle(const Pane& t) {
+    if (!t.changedLabel.empty() && t.searchActive) return L"Changed " + t.changedLabel;
     if (!t.tagFilter.empty()) {
         if (const TagDef* d = TagDefById(t.tagFilter)) return L"Tag: " + d->name;
     }
@@ -766,8 +969,8 @@ static void OpenSelection(Pane& t, bool newTab) {
     for (int v = 0; v < (int)t.view.size(); ++v) if (t.sel[t.view[v]]) picks.push_back(v);
     if (picks.empty() && t.focus >= 0) picks.push_back(t.focus);
     if (picks.empty()) return;
-    if (picks.size() > 15 && MessageBoxW(g_hwnd, (L"Open " + std::to_wstring(picks.size()) + L" items?").c_str(), L"Strata",
-                                         MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+    if (picks.size() > 15 && !ConfirmDialog(g_hwnd, L"Open " + std::to_wstring(picks.size()) + L" items?",
+                                            L"Each file opens in its own program.", L"Open all"))
         return;
     // Folders: the first navigates (or all open as tabs with Ctrl); files open with their programs
     bool navigated = false;
@@ -888,8 +1091,10 @@ static void DoDelete(bool permanent) {
     if (paths.empty()) return;
     if (permanent || g_config.confirmDelete) {
         std::wstring what = paths.size() == 1 ? L"\"" + PathLeaf(paths[0]) + L"\"" : std::to_wstring(paths.size()) + L" items";
-        std::wstring q = permanent ? L"Permanently delete " + what + L"?\n\nThis can't be undone." : L"Move " + what + L" to the Recycle Bin?";
-        if (MessageBoxW(g_hwnd, q.c_str(), L"Strata", MB_OKCANCEL | (permanent ? MB_ICONWARNING : MB_ICONQUESTION) | MB_DEFBUTTON2) != IDOK) return;
+        bool ok = permanent ? ConfirmDialog(g_hwnd, L"Permanently delete " + what + L"?", L"This skips the Recycle Bin and can't be undone.", L"Delete", true)
+                            : ConfirmDialog(g_hwnd, L"Move " + what + L" to the Recycle Bin?", L"Ctrl+Z puts it back.", L"Move to Recycle Bin",
+                                            false, DlgSpec::Question);
+        if (!ok) return;
     }
     FileOpAsync(g_hwnd, permanent ? OpKind::Delete : OpKind::Recycle, paths, L"");
 }
@@ -1162,14 +1367,29 @@ static void PaintTitleBar() {
     TabGeometry(left, tabW);
     float top = 6, bottom = kTitleH;
     int folderIcon = FolderIconIndex();
+    // the active tab's background slides to the newly chosen tab
+    if (g_drag == Drag::Tab) g_aTab.Jump((float)g_active);
+    else g_aTab.Target((float)g_active, 190);
+    {
+        float ax = left + g_aTab.Value() * tabW;
+        bool dragging = g_drag == Drag::Tab && g_dragMoved;
+        if (!dragging) g_cv.FillRound(R(ax + 2, top, ax + tabW - 2, bottom + 8), 8, MainColor());
+    }
     for (int i = 0; i < (int)g_tabs.size(); ++i) {
         float x = left + i * tabW;
         if (g_drag == Drag::Tab && g_dragMoved && i == g_dragIdx) continue;   // drawn last, under the cursor
         D2D1_RECT_F r = R(x + 2, top, x + tabW - 2, bottom);
         bool act = i == g_active;
+        const Tab& tab = g_tabs[i];
+        float appear = Since(tab.born, 200);
+        if (appear < 1) PushFade(R(r.left, r.top, r.right, r.bottom + 8), appear);
+        if (tab.color) {
+            // colored tabs: a tint and a bar along the top
+            g_cv.FillRound(R(r.left, r.top + (act ? 0 : 2), r.right, r.bottom - (act ? -8 : 4)), act ? 8 : 7, Alpha(Rgb(tab.color), act ? 0.14f : 0.10f));
+            g_cv.FillRound(R(r.left + 8, r.top + 1, r.right - 8, r.top + 4), 1.5f, Rgb(tab.color));
+        }
         if (act) {
-            // active tab joins the toolbar below
-            g_cv.FillRound(R(r.left, r.top, r.right, r.bottom + 8), 8, MainColor());
+            // (background drawn above so it can slide)
         } else if (Hot(ZTab, i) || Hot(ZTabClose, i)) {
             g_cv.FillRound(R(r.left, r.top + 2, r.right, r.bottom - 4), 7, g_theme.hover);
         } else if (i + 1 != g_active && i + 1 < (int)g_tabs.size()) {
@@ -1178,17 +1398,25 @@ static void PaintTitleBar() {
         AddZone(ZTab, i, r);
         const Pane& t = g_tabs[i].pane[g_tabs[i].active];
         float cy = (r.top + r.bottom) / 2 - (act ? 0 : 1);
-        bool showClose = act || Hot(ZTab, i) || Hot(ZTabClose, i);
-        float textRight = r.right - (showClose ? 30 : 10);
-        if (t.path.empty()) g_cv.Glyph(0xE7F8, g_fIcon, R(r.left + 8, cy - 8, r.left + 26, cy + 8), g_theme.accent);
+        bool showClose = !tab.locked && (act || Hot(ZTab, i) || Hot(ZTabClose, i));
+        float textRight = r.right - (showClose ? 30 : tab.locked ? 26 : 10);
+        if (t.path.empty()) g_cv.Glyph(0xE7F8, g_fIcon, R(r.left + 8, cy - 8, r.left + 26, cy + 8), tab.color ? Rgb(tab.color) : g_theme.accent);
         else DrawItemIcon(folderIcon, r.left + 10, cy, 16);
         g_cv.Text(PaneTitle(t), act ? g_fUiSemi : g_fUi, R(r.left + 32, r.top, textRight, r.bottom - (act ? 0 : 2)), act ? g_theme.text : textC);
-        if (showClose && tabW > 80) {
+        if (tab.locked) {
+            // a small padlock where the close button would be
+            float lx = r.right - 18, ly = cy;
+            D2D1_COLOR_F lc = Alpha(tab.color ? Rgb(tab.color) : g_theme.subtext, 0.95f);
+            g_cv.FillRound(R(lx - 5, ly - 1, lx + 5, ly + 6), 1.5f, lc);
+            g_cv.br->SetColor(lc);
+            g_rt->DrawRoundedRectangle(D2D1::RoundedRect(R(lx - 3, ly - 6, lx + 3, ly + 2), 3, 3), g_cv.br, 1.4f);
+        } else if (showClose && tabW > 80) {
             D2D1_RECT_F cr = R(r.right - 28, cy - 11, r.right - 6, cy + 11);
             AddZone(ZTabClose, i, cr);
             if (Hot(ZTabClose, i)) g_cv.FillRound(cr, 5, g_theme.hover);
             g_cv.Glyph(0xE711, g_fIconSmall, cr, g_theme.subtext);
         }
+        if (appear < 1) PopFade();
     }
     if (g_drag == Drag::Tab && g_dragMoved && g_dragIdx >= 0 && g_dragIdx < (int)g_tabs.size()) {
         POINT pt;
@@ -1320,12 +1548,13 @@ static void PaintToolbar() {
     // view switch: dual pane / single pane / grid
     if (g_config.showViewSwitch) {
         float w = 30;
-        D2D1_RECT_F seg = R(right - 3 * w - 4, cy - 15, right, cy + 15);
+        D2D1_RECT_F seg = R(right - 4 * w - 4, cy - 15, right, cy + 15);
         g_cv.FillRound(seg, 7, g_theme.surface);
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 4; ++i) {
             D2D1_RECT_F r = R(seg.left + 2 + i * w, seg.top + 2, seg.left + 2 + (i + 1) * w, seg.bottom - 2);
             AddZone(ZViewSwitch, i, r);
-            bool on = (i == 0 && DualMode() && t.viewMode == ViewList) || (i == 1 && !DualMode() && t.viewMode == ViewList) || (i == 2 && t.viewMode == ViewGrid);
+            bool on = (i == 0 && DualMode() && t.viewMode == ViewList) || (i == 1 && !DualMode() && t.viewMode == ViewList) ||
+                      (i == 2 && t.viewMode == ViewGrid) || (i == 3 && t.viewMode == ViewSpace);
             if (on) g_cv.FillRound(r, 5, Alpha(g_theme.accent, 0.22f));
             else if (Hot(ZViewSwitch, i)) g_cv.FillRound(r, 5, g_theme.hover);
             D2D1_COLOR_F c = on ? g_theme.accent : g_theme.subtext;
@@ -1336,9 +1565,15 @@ static void PaintToolbar() {
             } else if (i == 1) {
                 g_cv.StrokeRound(R(cx - 8, ccy - 6, cx + 8, ccy + 6), 1.5f, c, 1.2f);
                 for (int k = 0; k < 3; ++k) g_cv.Fill(R(cx - 5, ccy - 3 + k * 3, cx + 5, ccy - 2 + k * 3), c);
-            } else {
+            } else if (i == 2) {
                 for (int a = 0; a < 2; ++a)
                     for (int b = 0; b < 2; ++b) g_cv.StrokeRound(R(cx - 7 + a * 8, ccy - 7 + b * 8, cx - 1 + a * 8, ccy - 1 + b * 8), 1.2f, c, 1.2f);
+            } else {
+                // treemap: one big block and a few smaller ones
+                g_cv.FillRound(R(cx - 8, ccy - 6, cx, ccy + 6), 1.2f, Alpha(c, 0.85f));
+                g_cv.FillRound(R(cx + 1, ccy - 6, cx + 8, ccy - 0.5f), 1.2f, Alpha(c, 0.6f));
+                g_cv.FillRound(R(cx + 1, ccy + 0.5f, cx + 4, ccy + 6), 1.0f, Alpha(c, 0.45f));
+                g_cv.FillRound(R(cx + 5, ccy + 0.5f, cx + 8, ccy + 6), 1.0f, Alpha(c, 0.35f));
             }
         }
         right = seg.left - 8;
@@ -1410,7 +1645,8 @@ static void PaintToolbar() {
                sFocus ? g_theme.accent : g_theme.subtext);
     D2D1_RECT_F stb = R(g_rcSearchBox.left + 32, g_rcSearchBox.top, g_rcSearchBox.right - 30, g_rcSearchBox.bottom);
     if (t.filter.text.empty() && !sFocus) {
-        g_cv.Text(t.path.empty() ? std::wstring(L"Search all drives") : L"Search " + PaneTitle(t), g_fUi, stb, Alpha(g_theme.subtext, 0.8f));
+        g_cv.Text(!t.changedLabel.empty() && t.searchActive ? std::wstring(L"Changed " + t.changedLabel + L" — Esc to go back")
+                  : t.path.empty() ? std::wstring(L"Search all drives") : L"Search " + PaneTitle(t), g_fUi, stb, Alpha(g_theme.subtext, 0.8f));
         g_cv.Text(L"Ctrl+K", g_fSmallRight, R(stb.left, stb.top, g_rcSearchBox.right - 10, stb.bottom), Alpha(g_theme.subtext, 0.55f));
     } else {
         t.filter.Draw(g_cv, g_fInput, stb, g_theme.text, Alpha(g_theme.accent, 0.35f), g_theme.text, sFocus);
@@ -1509,14 +1745,17 @@ static void SideMove(ZoneKind k, int from, int to) {
 
 static void PaintSidebar() {
     float top = kTitleH + kToolH, bottom = g_H - (g_config.showStatusBar ? kStatusH : 0);
-    float w = g_config.sidebarWidth;
-    g_rcSidebar = R(0, top, w, bottom);
+    float vis = SidebarW(), w = g_config.sidebarWidth;   // (vis < w while it slides in or out)
+    g_rcSidebar = R(0, top, vis, bottom);
     g_cv.Fill(g_rcSidebar, SidebarColor());
-    AddZone(ZSideSplitter, -1, R(w - kSplitW / 2, top, w + kSplitW / 2, bottom));
-    if (g_drag == Drag::Splitter || Hot(ZSideSplitter)) g_cv.Fill(R(w - 1, top, w + 1, bottom), Alpha(g_theme.accent, 0.6f));
-    else g_cv.Fill(R(w - 0.5f, top, w + 0.5f, bottom), g_theme.divider);
+    AddZone(ZSideSplitter, -1, R(vis - kSplitW / 2, top, vis + kSplitW / 2, bottom));
+    if (g_drag == Drag::Splitter || Hot(ZSideSplitter)) g_cv.Fill(R(vis - 1, top, vis + 1, bottom), Alpha(g_theme.accent, 0.6f));
+    else g_cv.Fill(R(vis - 0.5f, top, vis + 0.5f, bottom), g_theme.divider);
 
-    g_rt->PushAxisAlignedClip(R(0, top, w - 1, bottom), D2D1_ANTIALIAS_MODE_ALIASED);
+    g_rt->PushAxisAlignedClip(R(0, top, std::max(0.0f, vis - 1), bottom), D2D1_ANTIALIAS_MODE_ALIASED);
+    D2D1_MATRIX_3X2_F oldTransform;
+    g_rt->GetTransform(&oldTransform);
+    if (vis < w) g_rt->SetTransform(D2D1::Matrix3x2F::Translation(vis - w, 0) * oldTransform);
     float y = top + 8 - g_sideScroll;
     const Pane& t = T();
     auto rowBg = [&](const D2D1_RECT_F& r, bool current, bool hot) {
@@ -1647,6 +1886,7 @@ static void PaintSidebar() {
     if (g_sideDrag.kind != ZNone && g_sideDrag.lineY >= 0)
         g_cv.FillRound(R(12, g_sideDrag.lineY - 1.5f, w - 12, g_sideDrag.lineY + 1.5f), 1.5f, g_theme.accent);
     g_sideContentH = y + g_sideScroll - top + 8;
+    g_rt->SetTransform(oldTransform);
     g_rt->PopAxisAlignedClip();
 }
 
@@ -1686,6 +1926,14 @@ static void ComputeColumns(Pane& t, float left) {
 // Item (view index) under a point in a pane, or -1. x < 0 ignores the horizontal position (list view).
 static int ItemAt(const Pane& t, float x, float y) {
     if (y < t.rcList.top || y >= t.rcList.bottom) return -1;
+    if (t.viewMode == ViewSpace) {
+        if (x < 0) return -1;
+        for (int v = 0; v < (int)t.spaceRects.size() && v < (int)t.view.size(); ++v) {
+            const D2D1_RECT_F& r = t.spaceRects[v];
+            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return v;
+        }
+        return -1;
+    }
     if (t.viewMode == ViewGrid) {
         if (x < 0) return -1;
         int col = (int)std::floor((x - t.rcList.left - 8) / t.tileW);
@@ -1827,6 +2075,121 @@ static void PaintGrid(Pane& t, int paneIdx, bool active) {
     }
 }
 
+// ---- Space view: a treemap of what's taking space here
+static uint32_t SpaceColor(const Item& it) {
+    if (it.isDir()) return 0;   // the accent color
+    std::wstring e;
+    size_t dot = it.name.find_last_of(L'.');
+    if (dot != std::wstring::npos) e = ToLower(it.name.substr(dot + 1));
+    auto in = [&](std::initializer_list<const wchar_t*> l) { for (auto x : l) if (e == x) return true; return false; };
+    if (in({L"jpg", L"jpeg", L"png", L"gif", L"bmp", L"tif", L"tiff", L"webp", L"heic", L"raw", L"cr2", L"nef", L"arw", L"psd", L"svg"})) return 0x30A46C;
+    if (in({L"mp4", L"mov", L"avi", L"mkv", L"wmv", L"m4v", L"webm", L"mts"})) return 0xE5484D;
+    if (in({L"mp3", L"wav", L"flac", L"m4a", L"aac", L"ogg", L"wma"})) return 0xD6409F;
+    if (in({L"pdf", L"doc", L"docx", L"xls", L"xlsx", L"xlsm", L"xlsb", L"csv", L"ppt", L"pptx", L"txt", L"rtf", L"md", L"one", L"msg", L"eml"})) return 0xF5A524;
+    if (in({L"dwg", L"dxf", L"dwf", L"dwfx", L"rvt", L"rfa", L"skp", L"ifc", L"nwd", L"nwc", L"nwf", L"pln", L"3dm"})) return 0x12A594;
+    if (in({L"zip", L"7z", L"rar", L"tar", L"gz", L"iso", L"cab", L"bak"})) return 0x8E4EC6;
+    if (in({L"exe", L"dll", L"msi", L"sys", L"vhd", L"vhdx", L"vmdk"})) return 0x8B8D98;
+    return 0x6E7582;
+}
+
+static void PaintSpace(Pane& t, int paneIdx, bool active) {
+    bool thisPC = DriveView(t);
+    D2D1_RECT_F area = R(t.rcList.left + 8, t.rcList.top + 8, t.rcList.right - 8, t.rcList.bottom - 8);
+    t.spaceRects.assign(t.view.size(), R(0, 0, 0, 0));
+    size_t n = std::min<size_t>(t.view.size(), 500);
+    std::vector<double> raw(n, 0);
+    std::vector<uint8_t> unknown(n, 0);
+    double known = 0;
+    for (size_t v = 0; v < n; ++v) {
+        const Item& it = t.items[t.view[v]];
+        if (thisPC) { raw[v] = (double)it.total; known += raw[v]; continue; }
+        if (it.isDir()) {
+            bool ok = false;
+            uint64_t b = DirSize(t, it, ok);
+            if (!ok) { unknown[v] = 1; continue; }
+            raw[v] = (double)b;
+        } else {
+            raw[v] = (double)it.size;
+        }
+        known += raw[v];
+    }
+    double rest = 0;
+    for (size_t v = n; v < t.view.size(); ++v) rest += (double)t.items[t.view[v]].size;
+    double placeholder = std::max(known * 0.006, 1.0);
+    std::vector<double> sizes(n);
+    for (size_t v = 0; v < n; ++v) sizes[v] = unknown[v] ? placeholder : raw[v];
+    std::vector<int> order(n);
+    for (size_t v = 0; v < n; ++v) order[v] = (int)v;
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return sizes[a] > sizes[b]; });
+    std::vector<double> sorted;
+    for (int v : order) sorted.push_back(sizes[v]);
+    if (rest > 0) sorted.push_back(rest);
+    auto rects = Squarify(sorted, area);
+    for (size_t k = 0; k < order.size(); ++k) t.spaceRects[order[k]] = rects[k];
+    bool focusList = active && g_focus == Focus::List;
+    for (size_t v = 0; v < n; ++v) {
+        D2D1_RECT_F r = t.spaceRects[v];
+        D2D1_RECT_F tile = R(r.left + 1.5f, r.top + 1.5f, r.right - 1.5f, r.bottom - 1.5f);
+        float w = tile.right - tile.left, h = tile.bottom - tile.top;
+        if (w < 1.5f || h < 1.5f) continue;
+        int idx = t.view[v];
+        const Item& it = t.items[idx];
+        uint32_t rgb = SpaceColor(it);
+        D2D1_COLOR_F c = rgb ? Rgb(rgb) : g_theme.accent;
+        bool hot = g_hotRow == (int)v && g_hotPane == paneIdx && g_drag == Drag::None;
+        bool sel = t.sel[idx] != 0;
+        float rad = std::min(5.0f, std::min(w, h) / 4);
+        g_cv.FillRound(tile, rad, Alpha(c, unknown[v] ? 0.10f : hot ? 0.46f : g_theme.dark ? 0.30f : 0.36f));
+        if (thisPC && it.total) {
+            // drives: the used part fills from the bottom
+            float used = 1.0f - (float)((double)it.freeBytes / (double)it.total);
+            g_cv.FillRound(R(tile.left, tile.bottom - h * std::clamp(used, 0.0f, 1.0f), tile.right, tile.bottom), rad, Alpha(c, 0.35f));
+        }
+        if (sel) g_cv.StrokeRound(tile, rad, focusList ? g_theme.accent : Alpha(g_theme.accent, 0.6f), 2);
+        else g_cv.StrokeRound(tile, rad, Alpha(c, unknown[v] ? 0.35f : 0.6f), 1);
+        if (w > 54 && h > 30) {
+            float ty = tile.top + 6;
+            bool big = w > 90 && h > 66;
+            if (big) {
+                DrawItemIcon(it.icon, tile.left + 8, ty + 9, 18);
+                ty += 22;
+            }
+            std::wstring name = DisplayName(it);
+            if (thisPC) { auto dn = g_driveNames.find(it.path); if (dn != g_driveNames.end()) name = dn->second; }
+            g_cv.Text(name, big ? g_fUiSemi : g_fSmall, R(tile.left + 8, ty, tile.right - 6, ty + 20), g_theme.text);
+            std::wstring sub = thisPC ? FormatSize(it.freeBytes) + L" free of " + FormatSize(it.total)
+                                      : unknown[v] ? L"calculating…" : FormatSize((uint64_t)raw[v]);
+            if (!thisPC && !unknown[v] && known > 0 && raw[v] / known >= 0.01)
+                sub += L"  ·  " + std::to_wstring((int)std::lround(raw[v] * 100 / known)) + L"%";
+            if (h > (big ? 70 : 44)) g_cv.Text(sub, g_fSmall, R(tile.left + 8, ty + (big ? 20 : 16), tile.right - 6, ty + (big ? 38 : 32)), g_theme.subtext);
+        }
+    }
+    if (rest > 0 && rects.size() > order.size()) {
+        D2D1_RECT_F r = rects.back();
+        D2D1_RECT_F tile = R(r.left + 1.5f, r.top + 1.5f, r.right - 1.5f, r.bottom - 1.5f);
+        g_cv.FillRound(tile, 4, Alpha(g_theme.text, 0.06f));
+        if (tile.right - tile.left > 60 && tile.bottom - tile.top > 30)
+            g_cv.Text(std::to_wstring(t.view.size() - n) + L" smaller items", g_fSmall, R(tile.left + 8, tile.top + 6, tile.right - 6, tile.top + 22), g_theme.subtext);
+    }
+}
+
+static std::wstring SpaceHeaderText(const Pane& t) {
+    bool thisPC = DriveView(t);
+    uint64_t total = 0;
+    size_t pending = 0;
+    for (int v : t.view) {
+        const Item& it = t.items[v];
+        if (thisPC) { total += it.total - std::min(it.total, it.freeBytes); continue; }
+        bool ok = true;
+        total += it.isDir() ? DirSize(t, it, ok) : it.size;
+        if (!ok) ++pending;
+    }
+    std::wstring s = (thisPC ? L"Used on all drives: " : L"Space used here: ") + FormatSize(total);
+    if (pending) s += L"   ·   measuring " + std::to_wstring(pending) + (pending == 1 ? L" folder…" : L" folders…");
+    else if (!thisPC) s += L"   ·   double-click a folder to look inside, Backspace to go up";
+    return s;
+}
+
 static void PaintPane(Pane& t, int paneIdx, const D2D1_RECT_F& area, bool active) {
     float left = area.left, top = area.top, bottom = area.bottom, right = area.right;
     t.rcPane = area;
@@ -1842,8 +2205,9 @@ static void PaintPane(Pane& t, int paneIdx, const D2D1_RECT_F& area, bool active
 
     // header (in grid view it shows the sort choice; the columns themselves are hidden)
     g_rt->PushAxisAlignedClip(t.rcHeader, D2D1_ANTIALIAS_MODE_ALIASED);
-    if (dual && active) g_cv.Fill(R(left, top, right, top + 2), g_theme.accent);
-    if (t.viewMode == ViewGrid) {
+    if (t.viewMode == ViewSpace) {
+        g_cv.Text(SpaceHeaderText(t), g_fHeader, R(left + 14, top, right - 12, top + kHeaderH), g_theme.subtext);
+    } else if (t.viewMode == ViewGrid) {
         float x = left + 12;
         for (int c = 0; c < ColCount; ++c) {
             const wchar_t* label = kColLabel[c];
@@ -1881,6 +2245,29 @@ static void PaintPane(Pane& t, int paneIdx, const D2D1_RECT_F& area, bool active
                       HotP(ZHeaderDiv, c.col, paneIdx) || (g_drag == Drag::Column && g_dragIdx == c.col) ? g_theme.accent : g_theme.divider);
         }
     }
+    // focus filter chip ("Only PDFs  ✕") on the right of the header
+    if (!t.focusFilter.empty()) {
+        std::wstring label = t.focusLabel.empty() ? t.focusFilter : t.focusLabel;
+        float tw = MeasureWidth(label, g_fSmall);
+        D2D1_RECT_F chip = R(right - 20 - tw - 46, top + 5, right - 10, top + kHeaderH - 5);
+        g_cv.Fill(R(chip.left - 14, top + 2, right, top + kHeaderH - 1), Alpha(g_theme.bg, 1.0f));
+        g_cv.FillRound(chip, (chip.bottom - chip.top) / 2, Mix(MainColor(), g_theme.accent, 0.22f));
+        AddZone(ZFocusChip, 0, chip, paneIdx);
+        if (HotP(ZFocusChip, 0, paneIdx)) g_cv.StrokeRound(chip, (chip.bottom - chip.top) / 2, Alpha(g_theme.accent, 0.7f), 1);
+        // funnel
+        float fx = chip.left + 13, fy = (chip.top + chip.bottom) / 2;
+        g_cv.br->SetColor(g_theme.accent);
+        g_rt->DrawLine(D2D1::Point2F(fx - 5, fy - 4), D2D1::Point2F(fx + 5, fy - 4), g_cv.br, 1.4f);
+        g_rt->DrawLine(D2D1::Point2F(fx - 5, fy - 4), D2D1::Point2F(fx - 1, fy + 1), g_cv.br, 1.4f);
+        g_rt->DrawLine(D2D1::Point2F(fx + 5, fy - 4), D2D1::Point2F(fx + 1, fy + 1), g_cv.br, 1.4f);
+        g_rt->DrawLine(D2D1::Point2F(fx - 1, fy + 1), D2D1::Point2F(fx - 1, fy + 5), g_cv.br, 1.4f);
+        g_rt->DrawLine(D2D1::Point2F(fx + 1, fy + 1), D2D1::Point2F(fx + 1, fy + 4), g_cv.br, 1.4f);
+        g_cv.Text(label, g_fSmall, R(chip.left + 24, chip.top, chip.right - 24, chip.bottom), g_theme.text);
+        D2D1_RECT_F x = R(chip.right - 22, chip.top + 2, chip.right - 4, chip.bottom - 2);
+        AddZone(ZFocusClear, 0, x, paneIdx);
+        if (HotP(ZFocusClear, 0, paneIdx)) g_cv.FillRound(x, (x.bottom - x.top) / 2, g_theme.hover);
+        g_cv.Glyph(0xE711, g_fIconSmall, x, g_theme.subtext);
+    }
     g_rt->PopAxisAlignedClip();
     g_cv.Fill(R(left, t.rcHeader.bottom - 0.5f, right, t.rcHeader.bottom + 0.5f), g_theme.divider);
     AddZone(ZList, -1, t.rcList, paneIdx);
@@ -1889,9 +2276,13 @@ static void PaintPane(Pane& t, int paneIdx, const D2D1_RECT_F& area, bool active
     // drop target: the folder shown in this pane
     if (!g_dropFolder.empty() && !t.path.empty() && _wcsicmp(g_dropFolder.c_str(), t.path.c_str()) == 0)
         g_cv.StrokeRound(R(t.rcList.left + 2, t.rcList.top + 2, t.rcList.right - 2, t.rcList.bottom - 2), 8, g_theme.accent, 2);
+    float appear = Since(t.shownAt, 180);
+    if (appear < 1) PushFade(t.rcList, 0.15f + 0.85f * appear);
     if (t.view.empty()) EmptyState(t);
 
-    if (t.viewMode == ViewGrid) {
+    if (t.viewMode == ViewSpace) {
+        if (!t.view.empty()) PaintSpace(t, paneIdx, active);
+    } else if (t.viewMode == ViewGrid) {
         PaintGrid(t, paneIdx, active);
     } else {
         // rows (virtualized: only the visible range is drawn)
@@ -1922,9 +2313,35 @@ static void PaintPane(Pane& t, int paneIdx, const D2D1_RECT_F& area, bool active
                 D2D1_RECT_F cell = R(c.left + 10, y, c.right - 10, y + rh);
                 switch (c.col) {
                     case ColName: {
-                        DrawTagDot(full, c.left + 2, ry);
-                        DrawItemIcon(it.icon, c.left + 8 + (16 - iconSz) / 2, ry, iconSz, fade);
-                        D2D1_RECT_F nr = R(c.left + 34, y, c.right - 8, y + rh);
+                        int sc = idx < (int)t.stackCount.size() ? t.stackCount[idx] : 0;
+                        float indent = sc < 0 ? 22.0f : 0.0f;
+                        if (sc < 0) {
+                            // older version under its newest: a little tree connector
+                            float lx = c.left + 16;
+                            g_cv.Fill(R(lx, y, lx + 1, ry), g_theme.divider);
+                            g_cv.Fill(R(lx, ry - 0.5f, lx + 10, ry + 0.5f), g_theme.divider);
+                        }
+                        DrawTagDot(full, c.left + 2 + indent, ry);
+                        DrawItemIcon(it.icon, c.left + 8 + indent + (16 - iconSz) / 2, ry, iconSz, sc < 0 ? fade * 0.8f : fade);
+                        D2D1_RECT_F nr = R(c.left + 34 + indent, y, c.right - 8, y + rh);
+                        if (sc > 1) {
+                            // "3 versions ▾" after the name ("×3" when the column is narrow)
+                            float nameW = MeasureWidth(DisplayName(it), g_fUi);
+                            std::wstring pill = std::to_wstring(sc) + L" versions";
+                            float pw = MeasureWidth(pill, g_fSmall) + 30;
+                            if (nameW + 10 + pw > nr.right - nr.left) { pill = L"\x00D7" + std::to_wstring(sc); pw = MeasureWidth(pill, g_fSmall) + 28; }
+                            float px = std::min(nr.left + nameW + 10, nr.right - pw);
+                            if (px > nr.left + 30) {
+                                D2D1_RECT_F pr = R(px, ry - 10, px + pw, ry + 10);
+                                nr.right = px - 4;
+                                bool open = t.openStacks.count(t.stackKeys[idx]) != 0;
+                                AddZone(ZStack, idx, pr, paneIdx);
+                                bool hotPill = HotP(ZStack, idx, paneIdx);
+                                g_cv.FillRound(pr, 10, Alpha(g_theme.accent, hotPill ? 0.30f : open ? 0.24f : 0.16f));
+                                g_cv.Text(pill, g_fSmall, R(pr.left + 9, pr.top, pr.right - 18, pr.bottom), g_theme.text);
+                                g_cv.Glyph(open ? 0xE70E : 0xE70D, g_fIconSmall, R(pr.right - 19, pr.top, pr.right - 5, pr.bottom), g_theme.accent);
+                            }
+                        }
                         if (active && g_focus == Focus::Rename && idx == g_renameItem) {
                             g_rcRenameBox = R(nr.left - 4, y + 3, std::max(nr.right, nr.left + 220), y + rh - 3);
                             g_cv.FillRound(g_rcRenameBox, 4, g_theme.surfaceStrong);
@@ -1932,7 +2349,7 @@ static void PaintPane(Pane& t, int paneIdx, const D2D1_RECT_F& area, bool active
                             g_renameInput.Draw(g_cv, g_fInput, R(g_rcRenameBox.left + 4, g_rcRenameBox.top, g_rcRenameBox.right - 4, g_rcRenameBox.bottom),
                                                g_theme.text, Alpha(g_theme.accent, 0.4f), g_theme.text, true);
                         } else {
-                            g_cv.Text(DisplayName(it), g_fUi, nr, tc);
+                            g_cv.Text(DisplayName(it), g_fUi, nr, sc < 0 ? Alpha(tc, 0.8f) : tc);
                         }
                         break;
                     }
@@ -1978,6 +2395,7 @@ static void PaintPane(Pane& t, int paneIdx, const D2D1_RECT_F& area, bool active
             }
         }
     }
+    if (appear < 1) PopFade();
     // marquee
     if (active && g_drag == Drag::Marquee && g_dragMoved) {
         D2D1_RECT_F m = R(std::min(g_marqueeA.x, g_marqueeB.x), std::min(g_marqueeA.y, g_marqueeB.y) - t.scroll + t.rcList.top,
@@ -1999,11 +2417,33 @@ static void PaintPane(Pane& t, int paneIdx, const D2D1_RECT_F& area, bool active
 }
 
 static void PaintPreview(const D2D1_RECT_F& area);    // preview panel section
+static void PaintToasts();                             // overlays section
+static void PaintOverlays();
+static bool JumpKey(UINT vk);
+static void JumpRefresh();
+static void JumpClose();
+static void QuickLookShow(bool on);
+static void QuickLookStep(int d);
+static void PlayChime(bool problem);
+static void ToggleSpace();
+static void JumpOpen();
+static POINT MenuPointBelowSearch();
+static void ChangedMenu(POINT pt);
+static void FocusFilterMenu(POINT pt);
+static void ShowToast(const std::wstring& title, const std::wstring& body, const std::wstring& folder, bool problem);
 static void PaintQueuePanel();                         // transfer queue section
 
-static float SidebarW() { return g_config.showSidebar ? g_config.sidebarWidth : 0.0f; }
+static float SidebarW() {
+    g_aSidebar.Target(g_config.showSidebar ? 1.0f : 0.0f, 170);
+    float k = g_aSidebar.Value();
+    return k < 0.002f ? 0.0f : g_config.sidebarWidth * k;
+}
 static float StatusH() { return g_config.showStatusBar ? kStatusH : 0.0f; }
-static float PreviewW() { return g_config.showPreview ? std::min(g_config.previewWidth, g_W * 0.45f) : 0.0f; }
+static float PreviewW() {
+    g_aPreview.Target(g_config.showPreview ? 1.0f : 0.0f, 170);
+    float k = g_aPreview.Value();
+    return k < 0.002f ? 0.0f : std::min(g_config.previewWidth, g_W * 0.45f) * k;
+}
 
 static void PaintPanes() {
     float left = SidebarW(), top = kTitleH + kToolH, bottom = g_H - StatusH();
@@ -2021,8 +2461,17 @@ static void PaintPanes() {
         g_cv.Fill(split, SidebarColor());
         AddZone(ZPaneSplitter, -1, split);
         g_cv.Fill(R(mid - 0.5f, top, mid + 0.5f, bottom), Hot(ZPaneSplitter) || g_drag == Drag::PaneSplit ? Alpha(g_theme.accent, 0.7f) : g_theme.divider);
+        // the active pane's accent bar slides across when you switch panes
+        g_aPaneBar.Target((float)tb.active, 180);
+        float k = g_aPaneBar.Value();
+        const D2D1_RECT_F& a = tb.pane[0].rcPane;
+        const D2D1_RECT_F& b = tb.pane[1].rcPane;
+        g_cv.Fill(R(a.left + (b.left - a.left) * k, top, a.right + (b.right - a.right) * k, top + 2), g_theme.accent);
     }
-    if (PreviewW() > 0) PaintPreview(R(right, top, g_W, bottom));
+    if (PreviewW() > 0) {
+        if (g_ql.open) g_cv.Fill(R(right, top, g_W, bottom), SidebarColor());
+        else PaintPreview(R(right, top, g_W, bottom));
+    }
 }
 
 // ============================================================ status bar
@@ -2060,6 +2509,10 @@ static void PaintStatus() {
         size_t hiddenCount = 0;
         if (!g_config.showHidden) for (auto& it : t.items) if (ItemHidden(it)) ++hiddenCount;
         if (hiddenCount) left += L"   ·   " + WithCommas(hiddenCount) + L" hidden (Ctrl+H)";
+        if (!t.focusFilter.empty() && !DriveView(t)) {
+            size_t outside = t.items.size() >= t.view.size() + hiddenCount ? t.items.size() - t.view.size() - hiddenCount : 0;
+            left += L"   ·   focus: " + (t.focusLabel.empty() ? t.focusFilter : t.focusLabel) + L" (" + WithCommas(outside) + L" not shown, Esc)";
+        }
     }
     g_cv.Text(left, g_fSmall, R(14, top, g_W * 0.6f, g_H), g_statusMsg.empty() ? g_theme.subtext : g_theme.text);
     // right side: transfer queue status when there is any, otherwise keyboard hints
@@ -2097,8 +2550,8 @@ static void PaintStatus() {
         g_cv.Text(q, g_fSmall, R(x0, top, zr.right - 6, g_H), g_theme.text);
         return;
     }
-    std::wstring hints = DualMode() ? L"Tab switch pane   ·   F5 copy   ·   F6 move   ·   Ctrl+K search   ·   F2 rename"
-                                    : L"Ctrl+K search   ·   Ctrl+L path   ·   F2 rename   ·   Ctrl+T new tab";
+    std::wstring hints = DualMode() ? L"Tab switch pane   ·   F5 copy   ·   F6 move   ·   Space quick look   ·   Ctrl+G jump"
+                                    : L"Space quick look   ·   Ctrl+G jump to folder   ·   Ctrl+K search   ·   F2 rename";
     g_cv.Text(hints, g_fSmallRight, R(g_W * 0.4f, top, g_W - 14, g_H), Alpha(g_theme.subtext, 0.75f));
 }
 
@@ -2175,18 +2628,21 @@ static void Paint() {
     GetClientRect(g_hwnd, &rc);
     g_W = Px2Dip(rc.right);
     g_H = Px2Dip(rc.bottom);
-    if (!g_tabs.empty() && g_config.showPreview) PreviewRefresh(false);   // follows the selection
+    if (!g_tabs.empty() && (g_config.showPreview || g_ql.open)) PreviewRefresh(false);   // follows the selection
     g_zones.clear();
+    g_overlayZoneStart = (size_t)-1;
     g_rt->BeginDraw();
     g_rt->Clear(g_theme.backdrop ? D2D1::ColorF(0, 0, 0, 0) : g_theme.bottomBg);
     if (!g_tabs.empty()) {
         PaintToolbar();
-        if (g_config.showSidebar) PaintSidebar();
+        if (SidebarW() > 0) PaintSidebar();
         else g_rcSidebar = R(0, 0, 0, 0);
         PaintPanes();
         if (g_config.showStatusBar) PaintStatus();
         PaintQueuePanel();
         PaintTitleBar();   // last, so the dragged tab floats over everything
+        PaintToasts();
+        PaintOverlays();
     }
     HRESULT hr = g_rt->EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) { DiscardDevice(); Redraw(); }
@@ -2196,7 +2652,9 @@ static void Paint() {
 static Zone HitZoneTop(float x, float y) {
     // prefer the most specific zone (later zones are drawn on top, but tabs/close and dividers need priority)
     Zone best{ZNone, -1, {}};
-    for (auto& z : g_zones) {
+    size_t from = g_overlayZoneStart < g_zones.size() ? g_overlayZoneStart : 0;   // an open overlay covers everything else
+    for (size_t zi = from; zi < g_zones.size(); ++zi) {
+        const Zone& z = g_zones[zi];
         if (!In(z.rc, x, y)) continue;
         if (z.kind == ZTabClose || z.kind == ZHeaderDiv || z.kind == ZSideSplitter || z.kind == ZScrollbar || z.kind == ZSearchClear) return z;
         best = z;
@@ -2300,6 +2758,7 @@ static void SidebarMenu(ZoneKind k, int idx, POINT pt) {
         AppendMenuW(m, MF_STRING, 16, L"Clear recent folders");
     } else {
         addMoves(m);
+        AppendMenuW(m, MF_STRING, 21, L"Show what's using space");
         AppendMenuW(m, MF_STRING, 20, L"Properties");
     }
     AppendMenuW(m, MF_STRING | (DualMode() ? 0 : MF_GRAYED), 5, L"Open in other pane");
@@ -2320,6 +2779,7 @@ static void SidebarMenu(ZoneKind k, int idx, POINT pt) {
         case 16: g_config.recentFolders.clear(); ConfigSave(); break;
         case 5: Navigate(OtherPane(), path); break;
         case 20: ShowProperties(g_hwnd, {path}); break;
+        case 21: Navigate(T(), path); T().spaceSticky = true; T().viewMode = ViewSpace; break;
     }
     Redraw();
 }
@@ -2333,9 +2793,23 @@ static void TabMenu(int idx, POINT pt) {
     AppendMenuW(m, MF_STRING | (g_tabs.size() > 1 ? 0 : MF_GRAYED), 4, L"Close other tabs");
     AppendMenuW(m, MF_STRING | (idx + 1 < (int)g_tabs.size() ? 0 : MF_GRAYED), 5, L"Close tabs to the right");
     AppendMenuW(m, MF_STRING | (g_closedTabs.empty() ? MF_GRAYED : 0), 6, L"Reopen closed tab\tCtrl+Shift+T");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (g_tabs[idx].locked ? MF_CHECKED : 0), 7, L"Lock tab to this folder");
+    HMENU colors = CreatePopupMenu();
+    static const struct { const wchar_t* name; uint32_t rgb; } kTabColors[] = {
+        {L"None", 0}, {L"Red", 0xE5484D}, {L"Orange", 0xF76B15}, {L"Yellow", 0xF5C518}, {L"Green", 0x30A46C},
+        {L"Teal", 0x12A594}, {L"Blue", 0x3E8EED}, {L"Purple", 0x8E4EC6}, {L"Pink", 0xD6409F}};
+    for (int c = 0; c < (int)std::size(kTabColors); ++c)
+        AppendMenuW(colors, MF_STRING | (g_tabs[idx].color == kTabColors[c].rgb ? MF_CHECKED : 0), 20 + c, kTabColors[c].name);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)colors, L"Tab color");
     UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
     DestroyMenu(m);
+    if (cmd >= 20 && cmd < 20 + std::size(kTabColors)) { g_tabs[idx].color = kTabColors[cmd - 20].rgb; Redraw(); return; }
     switch (cmd) {
+        case 7:
+            g_tabs[idx].locked = !g_tabs[idx].locked;
+            SetStatus(g_tabs[idx].locked ? L"Tab locked: folders you open from here appear in new tabs" : L"Tab unlocked");
+            break;
         case 1: AddTab(g_tabs[idx].pane[g_tabs[idx].active].path, true, idx + 1); break;
         case 2: {
             SessionTab st = TabState(g_tabs[idx]);
@@ -2345,16 +2819,20 @@ static void TabMenu(int idx, POINT pt) {
         }
         case 3: CloseTab(idx); break;
         case 4: {
-            Tab keep = std::move(g_tabs[idx]);
-            for (int i = 0; i < (int)g_tabs.size(); ++i) if (i != idx) g_closedTabs.push_back(TabState(g_tabs[i]));
-            g_tabs.clear();
-            g_tabs.push_back(std::move(keep));
-            g_active = 0;
-            ActivateTab(0);
+            // locked tabs stay
+            int keepId = g_tabs[idx].id;
+            for (int i = (int)g_tabs.size() - 1; i >= 0; --i)
+                if (g_tabs[i].id != keepId && !g_tabs[i].locked) { g_closedTabs.push_back(TabState(g_tabs[i])); g_tabs.erase(g_tabs.begin() + i); }
+            for (int i = 0; i < (int)g_tabs.size(); ++i) if (g_tabs[i].id == keepId) g_active = i;
+            ActivateTab(g_active);
             break;
         }
         case 5:
-            for (int i = (int)g_tabs.size() - 1; i > idx; --i) { g_closedTabs.push_back(TabState(g_tabs[i])); g_tabs.erase(g_tabs.begin() + i); }
+            for (int i = (int)g_tabs.size() - 1; i > idx; --i) {
+                if (g_tabs[i].locked) continue;
+                g_closedTabs.push_back(TabState(g_tabs[i]));
+                g_tabs.erase(g_tabs.begin() + i);
+            }
             if (g_active > idx) g_active = idx;
             ActivateTab(g_active);
             break;
@@ -2378,10 +2856,16 @@ static void AppMenu(POINT pt) {
     AppendMenuW(m, MF_STRING, 1, L"New tab\tCtrl+T");
     AppendMenuW(m, MF_STRING | (g_closedTabs.empty() ? MF_GRAYED : 0), 2, L"Reopen closed tab\tCtrl+Shift+T");
     AppendMenuW(m, MF_STRING | (g_undo.empty() ? MF_GRAYED : 0), 3, L"Undo\tCtrl+Z");
-    AppendMenuW(m, MF_STRING | (QueueSnapshot().empty() ? MF_GRAYED : 0), 4, L"Transfers");
+    AppendMenuW(m, MF_STRING | (QueueSnapshot().empty() ? MF_GRAYED : 0), 4, L"Transfers\tCtrl+J");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 40, L"Jump to folder…\tCtrl+G");
+    AppendMenuW(m, MF_STRING, 41, L"What changed…\tCtrl+Shift+H");
+    AppendMenuW(m, MF_STRING | (T().focusFilter.empty() ? 0 : MF_CHECKED), 42, L"Focus filter…\tCtrl+Shift+F");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (DualMode() ? MF_CHECKED : 0), 30, L"Dual pane\tCtrl+\\");
-    AppendMenuW(m, MF_STRING | (T().viewMode == ViewGrid ? MF_CHECKED : 0), 31, L"Grid view\tCtrl+G");
+    AppendMenuW(m, MF_STRING | (T().viewMode == ViewGrid ? MF_CHECKED : 0), 31, L"Grid view\tCtrl+Shift+G");
+    AppendMenuW(m, MF_STRING | (T().viewMode == ViewSpace ? MF_CHECKED : 0), 34, L"Space view\tCtrl+Shift+S");
+    AppendMenuW(m, MF_STRING | (g_config.stackVersions ? MF_CHECKED : 0), 35, L"Stack file versions");
     AppendMenuW(m, MF_STRING | (g_config.showPreview ? MF_CHECKED : 0), 32, L"Preview panel\tCtrl+P");
     AppendMenuW(m, MF_STRING | (g_config.showSidebar ? MF_CHECKED : 0), 33, L"Sidebar\tCtrl+B");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -2415,6 +2899,11 @@ static void AppMenu(POINT pt) {
         case 4: g_queueOpen = true; g_queueTouched = true; break;
         case 30: ToggleDual(); break;
         case 31: ToggleGrid(); break;
+        case 34: ToggleSpace(); break;
+        case 35: g_config.stackVersions = !g_config.stackVersions; ConfigSave(); for (auto& tb_ : g_tabs) for (auto& pn : tb_.pane) BuildView(pn); break;
+        case 40: JumpOpen(); break;
+        case 41: ChangedMenu(MenuPointBelowSearch()); break;
+        case 42: FocusFilterMenu(MenuPointBelowSearch()); break;
         case 32: TogglePreview(); break;
         case 33: g_config.showSidebar = !g_config.showSidebar; ConfigSave(); break;
         case 300: g_config.density = L"compact"; ConfigSave(); break;
@@ -2480,7 +2969,7 @@ static void OverflowMenu(POINT pt) {
 namespace {  // file-local type (keeps it from clashing with same-named types in other files)
 enum ItemCmd { IC_OpenLocation = 20, IC_OtherPane = 21, IC_CalcSize = 22, IC_SaveSearch = 23, IC_CopyToOther = 24, IC_MoveToOther = 25,
                IC_Extract = 26, IC_TagNone = 40, IC_TagFirst = 41, IC_OpenTab = 1, IC_Pin, IC_CopyPath, IC_Terminal, IC_NewFolder, IC_NewText, IC_Paste, IC_Refresh, IC_Props,
-               IC_SelectAll, IC_OpenWith };
+               IC_SelectAll, IC_OpenWith, IC_Space = 27, IC_Changed = 28, IC_FocusMenu = 29 };
 }  // namespace
 
 static void ListContextMenu(POINT screenPt, bool onItem) {
@@ -2508,6 +2997,8 @@ static void ListContextMenu(POINT screenPt, bool onItem) {
                 extra.push_back({IC_Pin, IsPinned(paths[0]) ? L"Unpin from sidebar" : L"Pin to sidebar"});
                 extra.push_back({IC_Terminal, L"Open terminal here"});
                 if (SizesAllowed(paths[0])) extra.push_back({IC_CalcSize, L"Calculate size"});
+                if (SizesAllowed(paths[0])) extra.push_back({IC_Space, L"Show what's using space"});
+                extra.push_back({IC_Changed, L"What changed inside…"});
             }
         }
         if (paths.size() == 1 && !singleDir && IsArchiveFile(paths[0])) extra.push_back({IC_Extract, L"Extract here"});
@@ -2546,6 +3037,8 @@ static void ListContextMenu(POINT screenPt, bool onItem) {
             case IC_CopyPath: CopyPathsToClipboard(paths); break;
             case IC_OtherPane: Navigate(OtherPane(), paths[0]); WatchActive(); break;
             case IC_CalcSize: SizesRequest({paths[0]}, true); SetStatus(L"Calculating the size of " + PathLeaf(paths[0]) + L"…"); break;
+            case IC_Space: Navigate(T(), paths[0]); T().spaceSticky = true; T().viewMode = ViewSpace; break;
+            case IC_Changed: Navigate(T(), paths[0]); ChangedMenu(screenPt); break;
             case IC_CopyToOther: TransferToOtherPane(JobKind::Copy); break;
             case IC_MoveToOther: TransferToOtherPane(JobKind::Move); break;
             case IC_Extract: {
@@ -2590,6 +3083,10 @@ static void ListContextMenu(POINT screenPt, bool onItem) {
     if (t.searchActive) AppendMenuW(m, MF_STRING, IC_SaveSearch, L"Save search to sidebar…");
     if (real && SizesAllowed(t.path)) AppendMenuW(m, MF_STRING, IC_CalcSize, L"Recalculate folder sizes");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (t.tagFilter.empty() ? 0 : MF_GRAYED), IC_Changed, L"What changed here…\tCtrl+Shift+H");
+    AppendMenuW(m, MF_STRING | (t.viewMode == ViewSpace ? MF_CHECKED : 0), IC_Space, L"Show what's using space\tCtrl+Shift+S");
+    AppendMenuW(m, MF_STRING | (t.focusFilter.empty() ? 0 : MF_CHECKED), IC_FocusMenu, L"Focus filter…\tCtrl+Shift+F");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (real ? 0 : MF_GRAYED), IC_Props, L"Properties");
     UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, g_hwnd, nullptr);
     DestroyMenu(m);
@@ -2604,6 +3101,9 @@ static void ListContextMenu(POINT screenPt, bool onItem) {
         case IC_Pin: TogglePin(t.path); break;
         case IC_Props: ShowProperties(g_hwnd, {t.path}); break;
         case IC_SaveSearch: SaveCurrentSearch(); break;
+        case IC_Changed: ChangedMenu(screenPt); break;
+        case IC_Space: ToggleSpace(); break;
+        case IC_FocusMenu: FocusFilterMenu(screenPt); break;
         case IC_CalcSize: {
             std::vector<std::wstring> dirs;
             for (int v : t.view) if (t.items[v].isDir()) dirs.push_back(ItemPath(t, t.items[v]));
@@ -2621,7 +3121,7 @@ static void SetFocusTo(Focus f) {
     bool caret = f != Focus::List;
     if (caret && !g_caretTimer) { SetTimer(g_hwnd, TIMER_CARET, GetCaretBlinkTime(), nullptr); g_caretTimer = true; }
     if (!caret && g_caretTimer) { KillTimer(g_hwnd, TIMER_CARET); g_caretTimer = false; }
-    g_pathInput.caretOn = T().filter.caretOn = g_renameInput.caretOn = true;
+    g_pathInput.caretOn = T().filter.caretOn = g_renameInput.caretOn = g_jump.input.caretOn = true;
     Redraw();
 }
 
@@ -2690,6 +3190,239 @@ static void TypeAhead(wchar_t ch) {
     if (!prev.empty() && !repeat) g_typeBuf = prev;   // no match: keep the old prefix
 }
 
+// ---- version stacks
+static void StackSet(Pane& t, int item, bool open) {
+    if (item < 0 || item >= (int)t.stackCount.size()) return;
+    int head = item;
+    if (t.stackCount[item] < 0)
+        for (auto& kv : t.stackMembers)
+            if (std::find(kv.second.begin(), kv.second.end(), item) != kv.second.end()) head = kv.first;
+    if (head < 0 || head >= (int)t.stackCount.size() || t.stackCount[head] < 2) return;
+    std::wstring key = t.stackKeys[head];
+    bool isOpen = t.openStacks.count(key) != 0;
+    if (open == isOpen) return;
+    if (open) t.openStacks.insert(key); else t.openStacks.erase(key);
+    BuildView(t);
+    for (int v = 0; v < (int)t.view.size(); ++v) if (t.view[v] == head) { t.focus = v; if (!open) SelectOnly(t, v); }
+    Redraw();
+}
+
+// ---- Space view
+static void ToggleSpace() {
+    Pane& t = T();
+    bool on = t.viewMode != ViewSpace;
+    t.spaceSticky = on;
+    if (on) t.viewMode = ViewSpace;
+    else ApplyFolderView(t);
+    if (on && !DriveView(t)) {
+        if (!t.path.empty() && !SizesAllowed(t.path)) SetStatus(L"Folder sizes are off for this drive (Settings → File operations)");
+        std::vector<std::wstring> dirs;
+        for (int v : t.view) if (t.items[v].isDir()) dirs.push_back(ItemPath(t, t.items[v]));
+        SizesRequest(dirs, false);
+    }
+    t.scroll = t.scrollTarget = 0;
+    t.shownAt = GetTickCount();
+    BuildView(t);
+    Redraw();
+}
+
+// ---- focus filter (Ctrl+Shift+F)
+static void SetFocusFilter(Pane& t, const std::wstring& query, const std::wstring& label) {
+    t.focusFilter = query;
+    t.focusLabel = label;
+    BuildView(t);
+    t.scroll = t.scrollTarget = 0;
+    if (t.focus < 0 && !t.view.empty()) t.focus = 0;
+    if (!query.empty()) SetStatus(L"Showing " + std::to_wstring(t.view.size()) + L" matching items   ·   Esc or ✕ shows everything again");
+    Redraw();
+}
+
+static POINT MenuPointBelowSearch() {
+    POINT pt{(LONG)(g_rcSearchBox.left * g_scale), (LONG)(g_rcSearchBox.bottom * g_scale) + 4};
+    ClientToScreen(g_hwnd, &pt);
+    return pt;
+}
+
+static void FocusFilterMenu(POINT pt) {
+    Pane& t = T();
+    struct P { const wchar_t* label; const wchar_t* query; };
+    static const P presets[] = {
+        {L"Only PDFs", L"type:pdf"},
+        {L"Only drawings (DWG, DXF, RVT…)", L"type:dwg,dxf,dwf,dwfx,rvt,rfa,skp,ifc,nwd,nwc"},
+        {L"Only Office documents", L"type:doc,docx,xls,xlsx,xlsm,xlsb,csv,ppt,pptx"},
+        {L"Only images", L"type:jpg,jpeg,png,gif,bmp,tif,tiff,webp,heic,raw,cr2,nef"},
+        {L"Only videos", L"type:mp4,mov,avi,mkv,wmv,m4v,webm"},
+        {L"Only archives", L"type:zip,7z,rar,tar,gz,iso"},
+        {L"Only folders", L"folder:"},
+        {L"Only files", L"file:"},
+        {nullptr, nullptr},
+        {L"Changed today", L"modified:today"},
+        {L"Changed this week", L"modified:7d"},
+        {L"Changed this month", L"modified:30d"},
+        {L"Bigger than 100 MB", L"size:>100mb"},
+    };
+    HMENU m = CreatePopupMenu();
+    int n = (int)std::size(presets);
+    for (int i = 0; i < n; ++i) {
+        if (!presets[i].label) { AppendMenuW(m, MF_SEPARATOR, 0, nullptr); continue; }
+        AppendMenuW(m, MF_STRING | (t.focusFilter == presets[i].query ? MF_CHECKED : 0), 1 + i, presets[i].label);
+    }
+    // same kind as the selected file
+    std::wstring ext;
+    if (t.focus >= 0 && t.focus < (int)t.view.size() && !t.items[t.view[t.focus]].isDir()) {
+        const std::wstring& nm = t.items[t.view[t.focus]].name;
+        size_t dot = nm.find_last_of(L'.');
+        if (dot != std::wstring::npos && dot + 1 < nm.size()) ext = ToLower(nm.substr(dot + 1));
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    if (!ext.empty()) AppendMenuW(m, MF_STRING, 100, (L"Only ." + ext + L" files, like the selection").c_str());
+    HMENU tags = CreatePopupMenu();
+    for (int i = 0; i < (int)g_config.tags.size(); ++i) AppendMenuW(tags, MF_STRING, 200 + i, g_config.tags[i].name.c_str());
+    AppendMenuW(m, MF_POPUP | (g_config.tags.empty() ? MF_GRAYED : 0), (UINT_PTR)tags, L"Only tagged");
+    AppendMenuW(m, MF_STRING, 101, L"Custom filter…");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (t.focusFilter.empty() ? MF_GRAYED : 0), 102, L"Show everything\tEsc");
+    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    DestroyMenu(m);
+    if (cmd >= 1 && cmd <= (UINT)n) SetFocusFilter(t, presets[cmd - 1].query, presets[cmd - 1].label);
+    else if (cmd == 100) SetFocusFilter(t, L"type:" + ext, L"Only ." + ext);
+    else if (cmd >= 200 && cmd < 200 + g_config.tags.size()) SetFocusFilter(t, L"tag:" + g_config.tags[cmd - 200].id, L"Tagged " + g_config.tags[cmd - 200].name);
+    else if (cmd == 101) {
+        std::wstring q = t.focusFilter;
+        if (TextDialog(g_hwnd, L"Custom filter", L"Show only what matches, for example  type:pdf  modified:7d  size:>50mb  *plan*  folder:", q, L"Filter"))
+            SetFocusFilter(t, q, q);
+    } else if (cmd == 102) SetFocusFilter(t, L"", L"");
+}
+
+// ---- What changed (Ctrl+Shift+H): every file in this folder and below that changed since …
+static std::wstring FriendlyTime(uint64_t unixSecs) {
+    FILETIME ft;
+    ULARGE_INTEGER u;
+    u.QuadPart = unixSecs * 10000000ULL + 116444736000000000ULL;
+    ft.dwLowDateTime = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+    return FormatDate(ft);
+}
+
+static void ShowChangedSince(Pane& t, uint64_t unixSince, const std::wstring& label) {
+    t.changedLabel = label;
+    t.sortColumn = ColModified;
+    t.sortDescending = true;
+    t.filter.SetText(L"");
+    StartSearch(t, L"file: since:" + std::to_wstring(unixSince));
+    t.changedLabel = label;
+    SetStatus(L"Files changed " + label + L"   ·   Esc goes back to the folder");
+}
+
+static void ChangedMenu(POINT pt) {
+    Pane& t = T();
+    uint64_t now = (uint64_t)time(nullptr), prev = 0;
+    bool havePrev = !t.path.empty() && VisitPrevious(t.path, prev);
+    HMENU m = CreatePopupMenu();
+    std::wstring where = t.path.empty() ? L"on every drive" : L"in " + PaneTitle(t);
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, (L"Files changed " + where).c_str());
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (havePrev ? 0 : MF_GRAYED), 1,
+                havePrev ? (L"Since my last visit (" + FriendlyTime(prev) + L")").c_str() : L"Since my last visit (no earlier visit yet)");
+    AppendMenuW(m, MF_STRING, 2, L"Today");
+    AppendMenuW(m, MF_STRING, 3, L"Last 7 days");
+    AppendMenuW(m, MF_STRING, 4, L"Last 30 days");
+    AppendMenuW(m, MF_STRING, 5, L"Since a date…");
+    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    DestroyMenu(m);
+    SYSTEMTIME lt;
+    GetLocalTime(&lt);
+    auto midnight = [&] {
+        SYSTEMTIME st = lt;
+        st.wHour = st.wMinute = st.wSecond = st.wMilliseconds = 0;
+        FILETIME lf, uf;
+        SystemTimeToFileTime(&st, &lf);
+        LocalFileTimeToFileTime(&lf, &uf);
+        ULARGE_INTEGER u{{uf.dwLowDateTime, uf.dwHighDateTime}};
+        return (u.QuadPart - 116444736000000000ULL) / 10000000ULL;
+    };
+    switch (cmd) {
+        case 1: ShowChangedSince(t, prev, L"since your last visit"); break;
+        case 2: ShowChangedSince(t, midnight(), L"today"); break;
+        case 3: ShowChangedSince(t, now - 7 * 86400, L"in the last 7 days"); break;
+        case 4: ShowChangedSince(t, now - 30 * 86400, L"in the last 30 days"); break;
+        case 5: {
+            wchar_t buf[32];
+            swprintf_s(buf, L"%04d-%02d-%02d", lt.wYear, lt.wMonth, lt.wDay > 1 ? lt.wDay - 1 : 1);
+            std::wstring d = buf;
+            if (!TextDialog(g_hwnd, L"Changed since", L"Show files changed since this date (YYYY-MM-DD):", d, L"Show")) break;
+            int y = 0, mo = 0, da = 0;
+            if (swscanf_s(d.c_str(), L"%d-%d-%d", &y, &mo, &da) != 3 || y < 1980 || mo < 1 || mo > 12 || da < 1 || da > 31) {
+                NoticeDialog(g_hwnd, L"That date isn't valid", L"Use the form 2026-03-01.", true);
+                break;
+            }
+            SYSTEMTIME st{};
+            st.wYear = (WORD)y; st.wMonth = (WORD)mo; st.wDay = (WORD)da;
+            FILETIME lf, uf;
+            SystemTimeToFileTime(&st, &lf);
+            LocalFileTimeToFileTime(&lf, &uf);
+            ULARGE_INTEGER u{{uf.dwLowDateTime, uf.dwHighDateTime}};
+            ShowChangedSince(t, (u.QuadPart - 116444736000000000ULL) / 10000000ULL, L"since " + d);
+            break;
+        }
+    }
+}
+
+// ---- Jump to folder (Ctrl+G)
+static void JumpRefresh() {
+    std::vector<std::wstring> pins, extra;
+    for (auto& p : g_config.pins) pins.push_back(p.path);
+    for (auto& d : g_drives) extra.push_back(d.root);
+    for (auto& r : g_config.recentFolders) extra.push_back(r);
+    g_jump.hits = JumpQuery(g_jump.input.text, pins, extra, 9);
+    g_jump.sel = 0;
+    Redraw();
+}
+static void JumpOpen() {
+    if (g_ql.open) QuickLookShow(false);
+    g_jump.open = true;
+    g_jump.openedAt = GetTickCount();
+    g_jump.input.SetText(L"");
+    JumpRefresh();
+    SetFocusTo(Focus::Jump);
+}
+static void JumpClose() {
+    if (!g_jump.open) return;
+    g_jump.open = false;
+    SetFocusTo(Focus::List);
+}
+static void JumpGo(int i, int mode) {   // mode 0: here, 1: new tab, 2: other pane
+    std::wstring text = g_jump.input.text;
+    if (i < 0 || i >= (int)g_jump.hits.size()) {
+        JumpClose();
+        if (!text.empty()) NavigateTyped(text);   // nothing matched: maybe it's a path
+        return;
+    }
+    std::wstring path = g_jump.hits[i].path;
+    JumpClose();
+    if (mode == 1) OpenFolderInNewTab(path, true);
+    else if (mode == 2) { if (!DualMode()) { g_config.layout = L"dual"; ConfigSave(); } SetActivePane(1 - TB().active); Navigate(T(), path); }
+    else Navigate(T(), path);
+}
+static bool JumpKey(UINT vk) {
+    bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+    int n = (int)g_jump.hits.size();
+    switch (vk) {
+        case VK_ESCAPE: JumpClose(); return true;
+        case VK_RETURN: JumpGo(g_jump.sel, ctrl ? 1 : shift ? 2 : 0); return true;
+        case VK_DOWN: if (n) g_jump.sel = (g_jump.sel + 1) % n; Redraw(); return true;
+        case VK_UP: if (n) g_jump.sel = (g_jump.sel - 1 + n) % n; Redraw(); return true;
+        case VK_TAB: if (n) g_jump.sel = (g_jump.sel + (shift ? n - 1 : 1)) % n; Redraw(); return true;
+        default: break;
+    }
+    if (ctrl && vk == 'G') { JumpClose(); return true; }
+    bool handled = false;
+    bool changed = g_jump.input.OnKey(g_hwnd, vk, handled);
+    if (changed) JumpRefresh();
+    else Redraw();
+    return true;
+}
+
 static bool GlobalShortcut(UINT vk, bool ctrl, bool shift, bool alt) {
     Pane& t = T();
     if (ctrl && !alt) {
@@ -2700,12 +3433,15 @@ static bool GlobalShortcut(UINT vk, bool ctrl, bool shift, bool alt) {
             case VK_PRIOR: ActivateTab((g_active - 1 + (int)g_tabs.size()) % (int)g_tabs.size()); return true;
             case VK_NEXT: ActivateTab((g_active + 1) % (int)g_tabs.size()); return true;
             case 'L': BeginPathEdit(); return true;
-            case 'K': case 'F': case 'E': FocusSearch(); return true;
+            case 'F': if (shift) { FocusFilterMenu(MenuPointBelowSearch()); return true; } FocusSearch(); return true;
+            case 'K': case 'E': FocusSearch(); return true;
             case 'R': Load(t, true); return true;
-            case 'H': g_config.showHidden = !g_config.showHidden; ConfigSave(); for (auto& tb_ : g_tabs) for (auto& pn : tb_.pane) BuildView(pn);
+            case 'H': if (shift) { ChangedMenu(MenuPointBelowSearch()); return true; }
+                      g_config.showHidden = !g_config.showHidden; ConfigSave(); for (auto& tb_ : g_tabs) for (auto& pn : tb_.pane) BuildView(pn);
                       SetStatus(g_config.showHidden ? L"Showing hidden items" : L"Hiding hidden items"); return true;
             case 'Z': if (!shift) { Undo(); return true; } break;
-            case 'G': ToggleGrid(); return true;
+            case 'G': if (shift) ToggleGrid(); else JumpOpen(); return true;
+            case 'S': if (shift) { ToggleSpace(); return true; } break;
             case 'P': TogglePreview(); return true;
             case 'B': g_config.showSidebar = !g_config.showSidebar; ConfigSave(); Redraw(); return true;
             case VK_OEM_5: ToggleDual(); return true;          // Ctrl+backslash
@@ -2737,6 +3473,7 @@ static bool GlobalShortcut(UINT vk, bool ctrl, bool shift, bool alt) {
 static bool OnInputKey(UINT vk) {
     TextInput* in = g_focus == Focus::Search ? &T().filter : g_focus == Focus::Path ? &g_pathInput : &g_renameInput;
     bool ctrl = GetKeyState(VK_CONTROL) < 0;
+    if (g_focus == Focus::Jump) return JumpKey(vk);
     if (vk == VK_ESCAPE) {
         if (g_focus == Focus::Search) {
             if (!T().filter.text.empty()) { T().filter.SetText(L""); OnFilterChanged(); }
@@ -2786,6 +3523,20 @@ static void OnKeyDown(UINT vk) {
         GlobalShortcut(vk, ctrl, shift, alt);
         return;
     }
+    if (g_ql.open) {
+        switch (vk) {
+            case VK_SPACE: case VK_ESCAPE: QuickLookShow(false); return;
+            case VK_LEFT: case VK_UP: case VK_PRIOR: QuickLookStep(-1); return;
+            case VK_RIGHT: case VK_DOWN: case VK_NEXT: QuickLookStep(1); return;
+            case VK_HOME: QuickLookStep(-1000000); return;
+            case VK_END: QuickLookStep(1000000); return;
+            case VK_RETURN: QuickLookShow(false); OpenSelection(T(), ctrl); return;
+            default:
+                if (!ctrl && !alt) return;   // other keys stay with the preview
+                QuickLookShow(false);
+                break;
+        }
+    }
     if (GlobalShortcut(vk, ctrl, shift, alt)) return;
     Pane& t = T();
     bool grid = t.viewMode == ViewGrid;
@@ -2795,8 +3546,14 @@ static void OnKeyDown(UINT vk) {
     switch (vk) {
         case VK_DOWN: MoveFocus(t, cur < 0 ? 0 : std::min(cur + step, (int)t.view.size() - 1), shift, ctrl); return;
         case VK_UP: MoveFocus(t, cur < 0 ? 0 : (cur - step < 0 ? cur : cur - step), shift, ctrl); return;
-        case VK_RIGHT: if (grid) MoveFocus(t, cur + 1, shift, ctrl); return;
-        case VK_LEFT: if (grid) MoveFocus(t, cur < 0 ? 0 : cur - 1, shift, ctrl); return;
+        case VK_RIGHT:
+            if (grid) MoveFocus(t, cur + 1, shift, ctrl);
+            else if (cur >= 0 && t.viewMode == ViewList) StackSet(t, t.view[cur], true);   // expand versions
+            return;
+        case VK_LEFT:
+            if (grid) MoveFocus(t, cur < 0 ? 0 : cur - 1, shift, ctrl);
+            else if (cur >= 0 && t.viewMode == ViewList) StackSet(t, t.view[cur], false);  // collapse versions
+            return;
         case VK_NEXT: MoveFocus(t, cur + page, shift, ctrl); return;
         case VK_PRIOR: MoveFocus(t, cur - page, shift, ctrl); return;
         case VK_TAB:
@@ -2817,6 +3574,9 @@ static void OnKeyDown(UINT vk) {
         case VK_DELETE: DoDelete(shift); return;
         case VK_ESCAPE:
             if (!t.filter.text.empty()) { t.filter.SetText(L""); OnFilterChanged(); }
+            else if (t.searchActive) { EndSearch(t); }   // leave search / "What changed" results
+            else if (SelectedCount(t) > 1) { std::fill(t.sel.begin(), t.sel.end(), 0); Redraw(); }
+            else if (!t.focusFilter.empty()) { SetFocusFilter(t, L"", L""); }
             else { std::fill(t.sel.begin(), t.sel.end(), 0); Redraw(); }
             return;
         case VK_APPS: {
@@ -2911,6 +3671,7 @@ static void OnLButtonDown(float x, float y, bool dbl) {
     if (g_focus == Focus::Rename && !In(g_rcRenameBox, x, y)) CommitRename(true);
     if (g_focus == Focus::Path && z.kind != ZPathBox && z.kind != ZCrumb && z.kind != ZCrumbArrow) SetFocusTo(Focus::List);
     if (g_focus == Focus::Search && z.kind != ZSearch && z.kind != ZSearchClear) SetFocusTo(Focus::List);
+    if (g_jump.open && z.kind != ZJumpItem && !(z.kind == ZNone && g_overlayZoneStart != (size_t)-1)) { JumpClose(); return; }
 
     switch (z.kind) {
         case ZTab:
@@ -2927,6 +3688,8 @@ static void OnLButtonDown(float x, float y, bool dbl) {
         case ZMenu: case ZSearchClear: case ZCrumb: case ZCrumbArrow: case ZCrumbOverflow: case ZSideThisPC: case ZSidePin: case ZSideDrive:
         case ZViewSwitch: case ZUpdatePill: case ZQueueStatus: case ZQueueJobPause: case ZQueueJobCancel: case ZQueueClear: case ZQueueClose:
         case ZPreviewButton: case ZSideTag: case ZSideSaved: case ZSideRecent: case ZSideSection: case ZPreviewToggle:
+        case ZStack: case ZFocusChip: case ZFocusClear: case ZJumpItem: case ZQlPrev: case ZQlNext: case ZQlClose: case ZQlOpen:
+        case ZOverlay: case ZToast: case ZToastAction: case ZToastClose:
             g_drag = SideReorderable(z.kind) ? Drag::SidePress : Drag::None;
             g_sideDrag = SideDrag{};
             g_dragIdx = z.idx;
@@ -3001,6 +3764,8 @@ static void OnLButtonDown(float x, float y, bool dbl) {
                     g_pressRow = v;
                     g_drag = Drag::ListPress;
                 }
+            } else if (t.viewMode == ViewSpace) {
+                if (!ctrl && !shift) std::fill(t.sel.begin(), t.sel.end(), 0);
             } else {
                 // empty area: start a marquee
                 g_drag = Drag::Marquee;
@@ -3220,13 +3985,29 @@ static void OnLButtonUp(float x, float y) {
             break;
         }
         case ZViewSwitch:
+            if (z.idx == 3) { ToggleSpace(); break; }
+            if (t.viewMode == ViewSpace) { t.spaceSticky = false; t.viewMode = ViewList; }
             if (z.idx == 0) { g_config.layout = L"dual"; if (t.viewMode == ViewGrid) { t.viewMode = ViewList; SaveFolderView(t); } }
             else if (z.idx == 1) { g_config.layout = L"single"; if (t.viewMode == ViewGrid) { t.viewMode = ViewList; SaveFolderView(t); } }
             else { t.viewMode = t.viewMode == ViewGrid ? ViewList : ViewGrid; SaveFolderView(t); EnsureVisible(t, t.focus); }
+            BuildView(t);
             ConfigSave();
             WatchActive();
             break;
         case ZPreviewToggle: TogglePreview(); break;
+        case ZStack: if (z.pane >= 0) { Pane& sp = PaneAt(z.pane); StackSet(sp, z.idx, !(sp.stackKeys.count(z.idx) && sp.openStacks.count(sp.stackKeys[z.idx]))); } break;
+        case ZFocusChip: if (z.pane >= 0) FocusFilterMenu(pt); break;
+        case ZFocusClear: if (z.pane >= 0) SetFocusFilter(PaneAt(z.pane), L"", L""); break;
+        case ZJumpItem: JumpGo(z.idx, ctrl ? 1 : 0); break;
+        case ZQlPrev: QuickLookStep(-1); break;
+        case ZQlNext: QuickLookStep(1); break;
+        case ZQlClose: case ZOverlay: if (g_ql.open) QuickLookShow(false); else JumpClose(); break;
+        case ZQlOpen: QuickLookShow(false); OpenSelection(T(), false); break;
+        case ZToastAction: {
+            for (auto& to : g_toasts) if (to.id == z.idx) { std::wstring f = to.folder; g_toasts.erase(std::find_if(g_toasts.begin(), g_toasts.end(), [&](const Toast& x) { return x.id == z.idx; })); Navigate(T(), f); break; }
+            break;
+        }
+        case ZToastClose: g_toasts.erase(std::remove_if(g_toasts.begin(), g_toasts.end(), [&](const Toast& x) { return x.id == z.idx; }), g_toasts.end()); break;
         case ZUpdatePill: UpdatePillClicked(); break;
         case ZQueueStatus: g_queueOpen = !g_queueOpen; g_queueTouched = true; break;
         case ZQueueClose: g_queueOpen = false; break;
@@ -3297,6 +4078,8 @@ static void OnRightClick(float x, float y) {
 }
 
 static void OnWheel(float x, float y, int delta) {
+    if (g_ql.open) { QuickLookStep(delta > 0 ? -1 : 1); return; }
+    if (g_jump.open) { int n = (int)g_jump.hits.size(); if (n) { g_jump.sel = std::clamp(g_jump.sel + (delta > 0 ? -1 : 1), 0, n - 1); Redraw(); } return; }
     Pane& t = T();
     if (In(g_rcSidebar, x, y)) {
         float maxS = std::max(0.0f, g_sideContentH - (g_rcSidebar.bottom - g_rcSidebar.top));
@@ -3366,7 +4149,7 @@ static void OnListing(Listing* L) {
             t.renameAfterLoad = false;
             if (rename && &t == &T() && t.focus >= 0) BeginRename();
         }
-        if (!t.restoreScroll) { t.scroll = t.scrollTarget = std::min(t.scrollTarget, MaxScroll(t)); }
+        if (!t.restoreScroll) { t.scroll = t.scrollTarget = std::min(t.scrollTarget, MaxScroll(t)); t.shownAt = GetTickCount(); }
         t.restoreScroll = false;
         if (t.focus < 0 && !t.view.empty()) t.focus = 0;
         ClampScroll(t);
@@ -3510,6 +4293,24 @@ static void OnJobDone(JobResult* r) {
                std::to_wstring(r->kind == JobKind::Copy ? r->created.size() : r->moved.size()) + L" item" +
                ((r->kind == JobKind::Copy ? r->created.size() : r->moved.size()) == 1 ? L"" : L"s") + L"   ·   Ctrl+Z to undo";
     SetStatus(msg);
+    // long transfers: a soft chime and a toast (a Windows notification when Strata isn't in front)
+    DWORD longMs = 10000;
+    if (const char* env = getenv("STRATA_NOTIFY_AFTER")) longMs = (DWORD)(atoi(env) * 1000);
+    if (!r->cancelled && r->ms >= longMs) {
+        bool problem = r->errors > 0;
+        std::wstring title = problem ? L"Transfer finished with problems" : r->kind == JobKind::Copy ? L"Copy finished" : L"Move finished";
+        std::wstring body = WithCommas(r->files) + (r->files == 1 ? L" file" : L" files") + L"  ·  " + FormatSize(r->bytes) + L"  ·  " +
+                            FormatDuration(r->ms / 1000.0) + L"  →  " + PathLeaf(r->dest);
+        if (problem) body = std::to_wstring(r->errors) + (r->errors == 1 ? L" problem" : L" problems") + L"  ·  " + body;
+        if (g_config.soundOnFinish) PlayChime(problem);
+        if (g_config.notifyOnFinish) {
+            ShowToast(title, body, r->dest, problem);
+            if (GetForegroundWindow() != g_hwnd || IsIconic(g_hwnd) || !IsWindowVisible(g_hwnd)) {
+                g_trayToastFolder = r->dest;
+                TrayNotify(g_hwnd, title, body);
+            }
+        }
+    }
     // select what arrived in the destination pane
     for (auto& tb_ : g_tabs) for (auto& pn : tb_.pane) {
         if (_wcsicmp(pn.path.c_str(), r->dest.c_str()) != 0) continue;
@@ -3530,44 +4331,38 @@ static void OnJobDone(JobResult* r) {
 
 // The copy engine asks about conflicts and errors through a dialog
 static void OnQueueAsk(QueueAsk* a) {
-    TASKDIALOGCONFIG tc{sizeof(tc)};
-    tc.hwndParent = g_hwnd;
-    tc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
-    tc.pszWindowTitle = L"Strata";
-    std::wstring main, content;
-    std::vector<TASKDIALOG_BUTTON> buttons;
+    DlgSpec d;
     if (a->kind == QueueAsk::Conflict) {
-        main = L"\"" + PathLeaf(a->dst) + L"\" already exists in " + PathLeaf(PathParent(a->dst));
+        d.heading = L"\"" + PathLeaf(a->dst) + L"\" already exists in " + PathLeaf(PathParent(a->dst));
         WIN32_FILE_ATTRIBUTE_DATA fs{}, fd{};
         GetFileAttributesExW(a->src.c_str(), GetFileExInfoStandard, &fs);
         GetFileAttributesExW(a->dst.c_str(), GetFileExInfoStandard, &fd);
         auto sz = [](const WIN32_FILE_ATTRIBUTE_DATA& f) { return FormatSize(((uint64_t)f.nFileSizeHigh << 32) | f.nFileSizeLow); };
-        content = L"Incoming:  " + sz(fs) + L",  modified " + FormatDate(fs.ftLastWriteTime) + L"\n" +
-                  L"Existing:   " + sz(fd) + L",  modified " + FormatDate(fd.ftLastWriteTime);
-        buttons = {{100, L"Replace"}, {101, L"Skip"}, {102, L"Keep both"}, {103, L"Cancel transfer"}};
-        tc.pszVerificationText = L"Do this for all conflicts";
+        int newer = CompareFileTime(&fs.ftLastWriteTime, &fd.ftLastWriteTime);
+        d.body = L"Incoming:   " + sz(fs) + L",  modified " + FormatDate(fs.ftLastWriteTime) + (newer > 0 ? L"   (newer)" : L"") + L"\n" +
+                 L"Existing:    " + sz(fd) + L",  modified " + FormatDate(fd.ftLastWriteTime) + (newer < 0 ? L"   (newer)" : L"");
+        d.icon = DlgSpec::Question;
+        d.buttons = {{100, L"Replace", true}, {101, L"Skip"}, {102, L"Keep both"}, {103, L"Cancel transfer"}};
+        d.cancelId = 103;
+        d.checkbox = L"Do this for all conflicts";
+        d.width = 520;
     } else if (a->kind == QueueAsk::Error) {
-        main = L"There was a problem";
-        content = a->message;
-        buttons = {{100, L"Try again"}, {101, L"Skip"}, {102, L"Cancel transfer"}};
-        tc.pszVerificationText = L"Skip all errors in this transfer";
+        d.heading = L"There was a problem";
+        d.body = a->message;
+        d.icon = DlgSpec::Warning;
+        d.buttons = {{100, L"Try again", true}, {101, L"Skip"}, {102, L"Cancel transfer"}};
+        d.cancelId = 102;
+        d.checkbox = L"Skip all errors in this transfer";
     } else {
-        main = L"Not enough free space";
-        content = a->message;
-        buttons = {{100, L"Try anyway"}, {101, L"Cancel transfer"}};
+        d.heading = L"Not enough free space";
+        d.body = a->message;
+        d.icon = DlgSpec::Warning;
+        d.buttons = {{100, L"Try anyway"}, {101, L"Cancel transfer", true}};
+        d.cancelId = 101;
     }
-    tc.pszMainInstruction = main.c_str();
-    tc.pszContent = content.c_str();
-    tc.pszMainIcon = a->kind == QueueAsk::Conflict ? TD_INFORMATION_ICON : TD_WARNING_ICON;
-    tc.cButtons = (UINT)buttons.size();
-    tc.pButtons = buttons.data();
-    tc.nDefaultButton = 100;
-    int button = 0;
-    BOOL verified = FALSE;
-    if (FAILED(TaskDialogIndirect(&tc, &button, nullptr, &verified))) button = a->kind == QueueAsk::Conflict ? 101 : 101;
-    if (button == IDCANCEL) button = a->kind == QueueAsk::Conflict ? 103 : a->kind == QueueAsk::Error ? 102 : 101;
-    a->answer = button - 100;
-    a->applyToAll = verified != FALSE;
+    DlgResult r = ShowDialog(g_hwnd, d);
+    a->answer = r.id - 100;
+    a->applyToAll = r.checked;
 }
 
 // ============================================================ thumbnails (grid view)
@@ -3673,7 +4468,7 @@ static void PreviewTarget(std::wstring& path, bool& isDir) {
 }
 
 static void PreviewRefresh(bool force = false) {
-    if (!g_config.showPreview || g_tabs.empty()) { if (!g_pv.path.empty()) PreviewClear(); return; }
+    if ((!g_config.showPreview && !g_ql.open) || g_tabs.empty()) { if (!g_pv.path.empty()) PreviewClear(); return; }
     std::wstring path;
     bool isDir;
     PreviewTarget(path, isDir);
@@ -3686,7 +4481,8 @@ static void PreviewRefresh(bool force = false) {
     g_pv.loading = true;
     g_pv.gitLoaded = false;
     if (!ArchiveOf(path).empty() && !IsArchiveFile(path)) { g_pv.loading = false; Redraw(); return; }   // inside an archive: details only
-    PreviewLoadAsync(g_hwnd, g_pv.gen, path, isDir, (int)(std::max(400.0f, PreviewW()) * g_scale * 1.5f));
+    float want = g_ql.open ? std::min(2200.0f, std::max(g_W, g_H)) : std::max(400.0f, PreviewW()) * 1.5f;
+    PreviewLoadAsync(g_hwnd, g_pv.gen, path, isDir, (int)(want * g_scale));
     if (isDir) {
         GitInfoAsync(g_hwnd, g_pv.gen, path);
         // sizes of the subfolders for "what's taking space"
@@ -3747,10 +4543,32 @@ static void TogglePreview() {
     Redraw();
 }
 
-static void QuickPreview() {
-    // Space: open the preview panel for the selection (Space again closes a quick preview)
-    if (g_config.showPreview && g_pv.quick) { g_config.showPreview = false; g_pv.quick = false; PreviewRefresh(); Redraw(); return; }
-    if (!g_config.showPreview) { g_config.showPreview = true; g_pv.quick = true; }
+static void QuickLookShow(bool on) {
+    if (on == g_ql.open) return;
+    Pane& t = T();
+    if (on) {
+        if (t.view.empty()) return;
+        if (t.focus < 0) t.focus = 0;
+        if (SelectedCount(t) == 0) SelectOnly(t, t.focus);
+    }
+    g_ql.open = on;
+    g_ql.openedAt = on ? GetTickCount() : 0;
+    PreviewHandlerClose();
+    g_pv.handlerShown = false;
+    PreviewRefresh(true);
+    Redraw();
+}
+
+static void QuickPreview() { QuickLookShow(!g_ql.open); }   // Space
+
+static void QuickLookStep(int d) {
+    Pane& t = T();
+    if (t.view.empty()) return;
+    int to = std::clamp((t.focus < 0 ? 0 : t.focus) + d, 0, (int)t.view.size() - 1);
+    if (to == t.focus && SelectedCount(t) == 1) return;
+    PreviewHandlerClose();
+    g_pv.handlerShown = false;
+    MoveFocus(t, to, false, false);
     PreviewRefresh(true);
     Redraw();
 }
@@ -3942,6 +4760,342 @@ static void PaintPreview(const D2D1_RECT_F& area) {
     if (g_pv.scroll > maxS) g_pv.scroll = maxS;
 }
 
+// ============================================================ overlays: quick look, jump to folder, toasts
+static void TextHighlighted(const std::wstring& s, IDWriteTextFormat* f, const D2D1_RECT_F& r, D2D1_COLOR_F base, D2D1_COLOR_F hi,
+                            const std::vector<std::pair<size_t, size_t>>& ranges) {
+    if (s.empty() || !f) return;
+    IDWriteTextLayout* lay = nullptr;
+    dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), f, std::max(1.0f, r.right - r.left), std::max(1.0f, r.bottom - r.top), &lay);
+    if (!lay) return;
+    ID2D1SolidColorBrush* hb = nullptr;
+    g_rt->CreateSolidColorBrush(hi, &hb);
+    for (auto& rg : ranges) {
+        if (rg.first >= s.size()) continue;
+        DWRITE_TEXT_RANGE tr{(UINT32)rg.first, (UINT32)std::min(rg.second, s.size() - rg.first)};
+        if (hb) lay->SetDrawingEffect(hb, tr);
+        lay->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, tr);
+    }
+    g_cv.br->SetColor(base);
+    g_rt->DrawTextLayout(D2D1::Point2F(r.left, r.top), lay, g_cv.br, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    SafeRelease(hb);
+    lay->Release();
+}
+
+static D2D1_COLOR_F CardColor() {
+    D2D1_COLOR_F c = Mix(g_theme.bg, g_theme.surface, g_theme.dark ? 0.55f : 0.0f);
+    c.a = 1;
+    return c;
+}
+
+static void CardShadow(const D2D1_RECT_F& r, float rad, float a) {
+    for (int i = 1; i <= 4; ++i) {
+        float g = i * 3.0f;
+        g_cv.FillRound(R(r.left - g * 0.6f, r.top - g * 0.2f + i, r.right + g * 0.6f, r.bottom + g), rad + g, Rgb(0x000000, 0.06f * a));
+    }
+}
+
+static void PaintQuickContent(const D2D1_RECT_F& box) {
+    const PreviewResult* r = g_pv.res;
+    if (g_pv.reloadBitmap && r) { g_pv.reloadBitmap = false; g_pv.bmp = MakeBitmap(r->img); }
+    bool handler = r && r->kind == PreviewResult::Handler;
+    if (handler) {
+        g_cv.FillRound(box, 8, g_theme.surface);
+        g_pv.contentRc = box;
+        if (g_pv.handlerShown) {
+            RECT rc{(LONG)(box.left * g_scale), (LONG)(box.top * g_scale), (LONG)(box.right * g_scale), (LONG)(box.bottom * g_scale)};
+            PreviewHandlerMove(rc);
+        } else {
+            g_cv.Text(L"Loading preview…", g_fCenter, R(box.left, (box.top + box.bottom) / 2 - 10, box.right, (box.top + box.bottom) / 2 + 10), g_theme.subtext);
+        }
+        return;
+    }
+    if (g_pv.bmp) {
+        D2D1_SIZE_F bs = g_pv.bmp->GetSize();
+        float k = std::min((box.right - box.left) / bs.width, (box.bottom - box.top) / bs.height);
+        k = std::min(k, 2.0f);
+        float w = bs.width * k, h = bs.height * k;
+        float cx = (box.left + box.right) / 2, cy = (box.top + box.bottom) / 2;
+        g_rt->DrawBitmap(g_pv.bmp, R(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        return;
+    }
+    if (r && r->kind == PreviewResult::Text) {
+        g_cv.FillRound(box, 8, g_theme.surface);
+        static IDWriteTextFormat* mono = nullptr;
+        if (!mono) mono = Format(MonoFont(), 13, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false, true);
+        g_rt->PushAxisAlignedClip(R(box.left + 2, box.top + 2, box.right - 2, box.bottom - 2), D2D1_ANTIALIAS_MODE_ALIASED);
+        std::wstring shown = r->text.substr(0, 20000);
+        IDWriteTextLayout* lay = nullptr;
+        if (mono) dw->CreateTextLayout(shown.c_str(), (UINT32)shown.size(), mono, box.right - box.left - 28, 100000, &lay);
+        if (lay) {
+            lay->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            g_cv.br->SetColor(g_theme.text);
+            g_rt->DrawTextLayout(D2D1::Point2F(box.left + 14, box.top + 12), lay, g_cv.br, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            lay->Release();
+        }
+        g_rt->PopAxisAlignedClip();
+        return;
+    }
+    // no visual preview: a big icon or thumbnail and a hint
+    float isz = std::min(160.0f, (box.bottom - box.top) * 0.4f);
+    float cx = (box.left + box.right) / 2, cy = (box.top + box.bottom) / 2 - 20;
+    int icon = -1;
+    Pane& t = T();
+    if (t.focus >= 0 && t.focus < (int)t.view.size()) icon = t.items[t.view[t.focus]].icon;
+    ID2D1Bitmap* tb = g_pv.isDir ? nullptr : ThumbFor(g_pv.path, (int)(isz * g_scale));
+    D2D1_RECT_F ir = R(cx - isz / 2, cy - isz / 2, cx + isz / 2, cy + isz / 2);
+    if (tb) {
+        D2D1_SIZE_F bs = tb->GetSize();
+        float k = std::min(isz / bs.width, isz / bs.height);
+        g_rt->DrawBitmap(tb, R(cx - bs.width * k / 2, cy - bs.height * k / 2, cx + bs.width * k / 2, cy + bs.height * k / 2), 1.0f,
+                         D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    } else {
+        DrawItemIcon(icon, ir.left, cy, isz);
+    }
+    std::wstring hint = g_pv.loading ? L"Loading…" : g_pv.isDir ? L"Enter opens this folder" : L"No preview for this kind of file — Enter opens it";
+    g_cv.Text(hint, g_fCenter, R(box.left, ir.bottom + 16, box.right, ir.bottom + 40), g_theme.subtext);
+}
+
+static void PaintQuickLook() {
+    float a = Since(g_ql.openedAt, 170);
+    D2D1_RECT_F all = R(0, 0, g_W, g_H);
+    g_cv.Fill(all, Rgb(0x000000, 0.50f * a));
+    AddZone(ZOverlay, 0, all);
+    float m = std::min(72.0f, g_W * 0.06f);
+    D2D1_RECT_F card = R(m, kTitleH + 14, g_W - m, g_H - 16);
+    if (card.right - card.left < 300 || card.bottom - card.top < 200) card = R(10, 10, g_W - 10, g_H - 10);
+    float lift = (1 - a) * 14;
+    card.top += lift;
+    card.bottom += lift;
+    PushFade(R(0, 0, g_W, g_H), a);
+    CardShadow(card, 14, 1);
+    g_cv.FillRound(card, 14, CardColor());
+    AddZone(ZNone, -1, card);
+    Pane& t = T();
+    // header: name, position, open + close
+    std::wstring name = g_pv.path.empty() ? L"" : PathLeaf(g_pv.path);
+    std::wstring pos = t.focus >= 0 ? std::to_wstring(t.focus + 1) + L" of " + WithCommas(t.view.size()) : L"";
+    D2D1_RECT_F close = R(card.right - 46, card.top + 10, card.right - 12, card.top + 42);
+    D2D1_RECT_F open = R(close.left - 84, card.top + 12, close.left - 8, card.top + 40);
+    g_cv.Text(name, g_fEmpty, R(card.left + 20, card.top + 10, open.left - 110, card.top + 42), g_theme.text);
+    g_cv.Text(pos, g_fSmallRight, R(open.left - 110, card.top + 10, open.left - 12, card.top + 42), g_theme.subtext);
+    AddZone(ZQlOpen, 0, open);
+    g_cv.FillRound(open, 14, Hot(ZQlOpen) ? Mix(g_theme.accent, Rgb(0xFFFFFF), 0.12f) : g_theme.accent);
+    g_cv.Text(L"Open", g_fCenter, open, g_theme.onAccent);
+    AddZone(ZQlClose, 0, close);
+    if (Hot(ZQlClose)) g_cv.FillRound(close, 6, g_theme.hover);
+    g_cv.Glyph(0xE711, g_fIcon, close, g_theme.subtext);
+    // content
+    D2D1_RECT_F box = R(card.left + 20, card.top + 54, card.right - 20, card.bottom - 46);
+    g_rt->PushAxisAlignedClip(box, D2D1_ANTIALIAS_MODE_ALIASED);
+    if (!g_pv.path.empty()) PaintQuickContent(box);
+    g_rt->PopAxisAlignedClip();
+    // footer: details in one line
+    std::wstring det;
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    if (!g_pv.path.empty() && GetFileAttributesExW(g_pv.path.c_str(), GetFileExInfoStandard, &fa)) {
+        if (!g_pv.isDir) det = FormatSize(((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
+        if (g_pv.res && g_pv.res->imgW) det += (det.empty() ? L"" : L"   ·   ") + std::to_wstring(g_pv.res->imgW) + L" × " + std::to_wstring(g_pv.res->imgH);
+        det += (det.empty() ? L"" : L"   ·   ") + std::wstring(L"Modified ") + FormatDate(fa.ftLastWriteTime);
+        det += L"   ·   " + PathParent(g_pv.path);
+    }
+    g_cv.Text(det, g_fSmall, R(card.left + 20, card.bottom - 40, card.right - 260, card.bottom - 12), g_theme.subtext);
+    g_cv.Text(L"← → flip   ·   Enter open   ·   Esc close", g_fSmallRight, R(card.right - 330, card.bottom - 40, card.right - 20, card.bottom - 12),
+              Alpha(g_theme.subtext, 0.75f));
+    // flip buttons on the card edges
+    float cy = (box.top + box.bottom) / 2;
+    for (int k = 0; k < 2; ++k) {
+        bool prev = k == 0;
+        bool enabled = prev ? t.focus > 0 : t.focus + 1 < (int)t.view.size();
+        if (!enabled) continue;
+        float cx = prev ? card.left - m / 2 : card.right + m / 2;
+        if (m < 40) cx = prev ? card.left + 30 : card.right - 30;
+        D2D1_RECT_F b = R(cx - 20, cy - 20, cx + 20, cy + 20);
+        ZoneKind zk = prev ? ZQlPrev : ZQlNext;
+        AddZone(zk, 0, b);
+        g_cv.Circle(cx, cy, 20, Hot(zk) ? Alpha(g_theme.text, 0.30f) : Alpha(CardColor(), 0.92f));
+        g_cv.Glyph(prev ? 0xE76B : 0xE76C, g_fIcon, b, g_theme.text);
+    }
+    PopFade();
+}
+
+static void PaintJump() {
+    float a = Since(g_jump.openedAt, 150);
+    D2D1_RECT_F all = R(0, 0, g_W, g_H);
+    g_cv.Fill(all, Rgb(0x000000, 0.30f * a));
+    AddZone(ZOverlay, 1, all);
+    float w = std::min(680.0f, g_W - 40);
+    float x = (g_W - w) / 2, top = kTitleH + 22 - (1 - a) * 10;
+    float rowH = 50, inputH = 54, footH = 34;
+    int rows = std::max(1, (int)g_jump.hits.size());
+    D2D1_RECT_F card = R(x, top, x + w, top + inputH + rows * rowH + footH + 8);
+    PushFade(all, a);
+    CardShadow(card, 12, 1);
+    g_cv.FillRound(card, 12, CardColor());
+    g_cv.StrokeRound(card, 12, g_theme.divider, 1);
+    AddZone(ZNone, -1, card);
+    // input
+    g_cv.Glyph(0xE8DA, g_fIcon, R(card.left + 14, card.top, card.left + 40, card.top + inputH), g_theme.accent);
+    D2D1_RECT_F ib = R(card.left + 48, card.top + 8, card.right - 16, card.top + inputH - 8);
+    if (g_jump.input.text.empty())
+        g_cv.Text(L"Jump to a folder — type part of its name, e.g. \"smi bid\"", g_fUi, ib, Alpha(g_theme.subtext, 0.8f));
+    g_jump.input.Draw(g_cv, g_fInput, ib, g_theme.text, Alpha(g_theme.accent, 0.35f), g_theme.text, g_focus == Focus::Jump);
+    g_cv.Fill(R(card.left + 12, card.top + inputH, card.right - 12, card.top + inputH + 0.5f), g_theme.divider);
+    float y = card.top + inputH + 4;
+    int folderIcon = FolderIconIndex();
+    if (g_jump.hits.empty()) {
+        std::wstring msg = g_jump.input.text.empty() ? L"Folders you open show up here, most used first"
+                                                     : L"No folder you've visited matches — Enter tries it as a path";
+        g_cv.Text(msg, g_fUi, R(card.left + 24, y, card.right - 16, y + rowH), g_theme.subtext);
+    }
+    for (int i = 0; i < (int)g_jump.hits.size(); ++i) {
+        const JumpHit& h = g_jump.hits[i];
+        D2D1_RECT_F row = R(card.left + 6, y, card.right - 6, y + rowH - 2);
+        AddZone(ZJumpItem, i, row);
+        bool sel = i == g_jump.sel;
+        if (sel) {
+            g_cv.FillRound(row, 8, Alpha(g_theme.accent, 0.16f));
+            g_cv.FillRound(R(row.left, row.top + 12, row.left + 3, row.bottom - 12), 1.5f, g_theme.accent);
+        } else if (Hot(ZJumpItem, i)) {
+            g_cv.FillRound(row, 8, g_theme.hover);
+        }
+        bool root = h.path.size() <= 3;
+        int icon = folderIcon;
+        if (root) for (auto& d : g_drives) if (_wcsicmp(d.root.c_str(), h.path.c_str()) == 0) icon = d.icon;
+        DrawItemIcon(icon, row.left + 14, (row.top + row.bottom) / 2, 20);
+        std::wstring leaf = root ? (g_driveNames.count(h.path) ? g_driveNames[h.path] : h.path) : PathLeaf(h.path);
+        std::wstring parent = root ? h.path : PathParent(h.path);
+        auto hl = JumpHighlights(h.path, g_jump.input.text);
+        size_t leafStart = root ? std::wstring::npos : h.path.size() - leaf.size();
+        std::vector<std::pair<size_t, size_t>> hlLeaf, hlParent;
+        for (auto& rg : hl) {
+            if (leafStart != std::wstring::npos && rg.first >= leafStart) hlLeaf.push_back({rg.first - leafStart, rg.second});
+            else if (rg.first < parent.size()) hlParent.push_back(rg);
+        }
+        float tx = row.left + 46, tr = row.right - (h.pinned ? 70 : 16);
+        TextHighlighted(leaf, g_fUiSemi, R(tx, row.top + 5, tr, row.top + 26), g_theme.text, g_theme.accent, hlLeaf);
+        TextHighlighted(parent, g_fSmall, R(tx, row.top + 26, tr, row.bottom - 2), g_theme.subtext, g_theme.accent, hlParent);
+        if (h.pinned) g_cv.Text(L"pinned", g_fSmallRight, R(row.right - 70, row.top, row.right - 14, row.bottom), Alpha(g_theme.subtext, 0.7f));
+        y += rowH;
+    }
+    g_cv.Text(L"↑↓ choose   ·   Enter open   ·   Ctrl+Enter new tab   ·   Shift+Enter other pane   ·   Esc close", g_fSmall,
+              R(card.left + 20, card.bottom - footH, card.right - 16, card.bottom - 6), Alpha(g_theme.subtext, 0.75f));
+    PopFade();
+}
+
+static void PaintToasts() {
+    if (g_toasts.empty()) return;
+    DWORD now = GetTickCount();
+    float w = std::min(380.0f, g_W - 40), h = 82;
+    float right = g_W - 14 - (g_queueOpen ? std::min(460.0f, g_W - 40) + 12 : 0);
+    float bottom = g_H - StatusH() - 12;
+    for (int i = (int)g_toasts.size() - 1; i >= 0; --i) {
+        Toast& to = g_toasts[i];
+        float in = Since(to.born, 240);
+        DWORD age = now - to.born;
+        float out = age > kToastLife - 300 ? std::max(0.0f, (kToastLife - age) / 300.0f) : 1.0f;
+        float a = std::min(in, out);
+        float slide = (1 - in) * 40;
+        D2D1_RECT_F card = R(right - w + slide, bottom - h, right + slide, bottom);
+        PushFade(R(card.left - 20, card.top - 20, card.right + 20, card.bottom + 20), a);
+        CardShadow(card, 10, 0.8f);
+        g_cv.FillRound(card, 10, CardColor());
+        g_cv.StrokeRound(card, 10, g_theme.divider, 1);
+        AddZone(ZToast, to.id, card);
+        D2D1_COLOR_F c = to.problem ? Rgb(0xF5A524) : Rgb(0x30A46C);
+        g_cv.Circle(card.left + 26, card.top + 26, 13, Alpha(c, 0.2f));
+        // check mark or "!"
+        g_cv.br->SetColor(c);
+        if (to.problem) {
+            g_rt->DrawLine(D2D1::Point2F(card.left + 26, card.top + 19), D2D1::Point2F(card.left + 26, card.top + 28), g_cv.br, 2.0f);
+            g_cv.Circle(card.left + 26, card.top + 32.5f, 1.4f, c);
+        } else {
+            g_rt->DrawLine(D2D1::Point2F(card.left + 20, card.top + 26.5f), D2D1::Point2F(card.left + 24.5f, card.top + 31), g_cv.br, 2.0f);
+            g_rt->DrawLine(D2D1::Point2F(card.left + 24.5f, card.top + 31), D2D1::Point2F(card.left + 32.5f, card.top + 21.5f), g_cv.br, 2.0f);
+        }
+        g_cv.Text(to.title, g_fUiSemi, R(card.left + 50, card.top + 10, card.right - 40, card.top + 32), g_theme.text);
+        g_cv.Text(to.body, g_fSmall, R(card.left + 50, card.top + 32, card.right - 14, card.top + 50), g_theme.subtext);
+        D2D1_RECT_F act = R(card.left + 50, card.bottom - 30, card.left + 50 + MeasureWidth(L"Open folder", g_fSmall) + 22, card.bottom - 8);
+        AddZone(ZToastAction, to.id, act);
+        g_cv.FillRound(act, 11, Hot(ZToastAction, to.id) ? Alpha(g_theme.accent, 0.3f) : Alpha(g_theme.accent, 0.16f));
+        g_cv.Text(L"Open folder", g_fSmall, R(act.left + 11, act.top, act.right - 6, act.bottom), g_theme.text);
+        D2D1_RECT_F x = R(card.right - 32, card.top + 8, card.right - 8, card.top + 32);
+        AddZone(ZToastClose, to.id, x);
+        if (Hot(ZToastClose, to.id)) g_cv.FillRound(x, 5, g_theme.hover);
+        g_cv.Glyph(0xE711, g_fIconSmall, x, g_theme.subtext);
+        PopFade();
+        bottom -= h + 10;
+    }
+}
+
+static void PaintOverlays() {
+    if (g_ql.open) { g_overlayZoneStart = g_zones.size(); PaintQuickLook(); }
+    else if (g_jump.open) { g_overlayZoneStart = g_zones.size(); PaintJump(); }
+}
+
+// ---- toasts + the "transfer finished" chime
+static void ShowToast(const std::wstring& title, const std::wstring& body, const std::wstring& folder, bool problem) {
+    Toast t;
+    t.id = g_toastNext++;
+    t.title = title;
+    t.body = body;
+    t.folder = folder;
+    t.problem = problem;
+    t.born = GetTickCount();
+    g_toasts.push_back(t);
+    if (g_toasts.size() > 3) g_toasts.erase(g_toasts.begin());
+    SetTimer(g_hwnd, TIMER_TOAST, 250, nullptr);
+    AnimKick(260);
+    Redraw();
+}
+
+static void ExpireToasts() {
+    DWORD now = GetTickCount();
+    POINT pt;
+    GetCursorPos(&pt);
+    ScreenToClient(g_hwnd, &pt);
+    bool hovering = g_hotKind == ZToast || g_hotKind == ZToastAction || g_hotKind == ZToastClose;
+    for (auto& t : g_toasts) if (hovering && now - t.born > kToastLife - 1500) t.born = now - (kToastLife - 1500);   // hovering keeps them
+    g_toasts.erase(std::remove_if(g_toasts.begin(), g_toasts.end(), [&](const Toast& t) { return now - t.born >= kToastLife; }), g_toasts.end());
+    if (g_toasts.empty()) KillTimer(g_hwnd, TIMER_TOAST);
+    Redraw();
+}
+
+// A soft two-note chime, made in memory (no sound files to ship)
+static void PlayChime(bool problem) {
+    static std::vector<uint8_t> wav[2];
+    std::vector<uint8_t>& buf = wav[problem ? 1 : 0];
+    if (buf.empty()) {
+        const int rate = 44100;
+        const double len = 1.1;
+        int n = (int)(rate * len);
+        std::vector<int16_t> pcm(n, 0);
+        struct Note { double f, start; };
+        Note ok[] = {{880.0, 0.0}, {1318.5, 0.12}};
+        Note bad[] = {{659.3, 0.0}, {523.3, 0.16}};
+        Note* notes = problem ? bad : ok;
+        for (int k = 0; k < 2; ++k) {
+            for (int i = 0; i < n; ++i) {
+                double t = i / (double)rate - notes[k].start;
+                if (t < 0) continue;
+                double env = std::min(1.0, t / 0.006) * std::exp(-t / 0.22);
+                double v = std::sin(2 * 3.14159265358979 * notes[k].f * t) + 0.18 * std::sin(2 * 3.14159265358979 * notes[k].f * 2 * t);
+                int s = pcm[i] + (int)(v * env * 0.20 * 32767);
+                pcm[i] = (int16_t)std::clamp(s, -32767, 32767);
+            }
+        }
+        uint32_t dataBytes = (uint32_t)(pcm.size() * 2);
+        auto put32 = [&](uint32_t v) { for (int b = 0; b < 4; ++b) buf.push_back((uint8_t)(v >> (8 * b))); };
+        auto put16 = [&](uint16_t v) { buf.push_back((uint8_t)v); buf.push_back((uint8_t)(v >> 8)); };
+        auto tag = [&](const char* s4) { for (int b = 0; b < 4; ++b) buf.push_back((uint8_t)s4[b]); };
+        tag("RIFF"); put32(36 + dataBytes); tag("WAVE");
+        tag("fmt "); put32(16); put16(1); put16(1); put32(rate); put32(rate * 2); put16(2); put16(16);
+        tag("data"); put32(dataBytes);
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(pcm.data());
+        buf.insert(buf.end(), p, p + dataBytes);
+    }
+    PlaySoundW(reinterpret_cast<LPCWSTR>(buf.data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+}
+
 // ============================================================ toggles, updates, saved searches
 static void ToggleDual() {
     g_config.layout = DualMode() ? L"single" : L"dual";
@@ -4018,21 +5172,14 @@ static void UpdatePillClicked() {
     // changelog + one-click update
     std::wstring notes = PlainNotes(st.release.notes);
     if (notes.size() > 1800) notes = notes.substr(0, 1800) + L"…";
-    TASKDIALOGCONFIG tc{sizeof(tc)};
-    tc.hwndParent = g_hwnd;
-    tc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW | TDF_USE_COMMAND_LINKS;
-    tc.pszWindowTitle = L"Strata update";
-    std::wstring main = L"Strata " + st.release.version + L" is available";
-    std::wstring content = L"You have " STRATA_VERSION L".\n\n" + notes;
-    tc.pszMainInstruction = main.c_str();
-    tc.pszContent = content.c_str();
-    tc.pszMainIcon = TD_INFORMATION_ICON;
-    TASKDIALOG_BUTTON buttons[] = {{100, L"Update now\nDownloads, verifies and restarts Strata. Your tabs come back."},
-                                   {101, L"Later"}, {102, L"View on GitHub"}};
-    tc.cButtons = 3;
-    tc.pButtons = buttons;
-    int b = 0;
-    if (FAILED(TaskDialogIndirect(&tc, &b, nullptr, nullptr))) return;
+    DlgSpec d;
+    d.heading = L"Strata " + st.release.version + L" is available";
+    d.body = L"You have " STRATA_VERSION L". Updating downloads and verifies the new version, then restarts Strata — your tabs come back.\n\n" + notes;
+    d.icon = DlgSpec::Update;
+    d.buttons = {{102, L"View on GitHub"}, {101, L"Later"}, {100, L"Update now", true}};
+    d.cancelId = 101;
+    d.width = 520;
+    int b = ShowDialog(g_hwnd, d).id;
     if (b == 100) {
         if (QueueBusy()) SetStatus(L"The update will install when your file transfers finish");
         g_installWhenReady = true;
@@ -4095,6 +5242,7 @@ static void SaveSession() {
 static void ReleaseForUpdate() {
     if (g_focus == Focus::Rename) CommitRename(true);
     SaveSession();
+    VisitsSave(true);
     SettingsClose();
     PreviewHandlerClose();
     TrayRemove();
@@ -4123,6 +5271,13 @@ static void ShowMainWindow() {
 
 void TrayOnMessage(HWND owner, LPARAM lp) {
     UINT ev = LOWORD(lp);
+    if (ev == NIN_BALLOONUSERCLICK) {
+        TrayRemoveIfTemporary();
+        ShowMainWindow();
+        if (!g_trayToastFolder.empty() && !g_tabs.empty()) Navigate(T(), g_trayToastFolder);
+        return;
+    }
+    if (ev == NIN_BALLOONTIMEOUT || ev == NIN_BALLOONHIDE) { TrayRemoveIfTemporary(); return; }
     if (ev == WM_LBUTTONUP || ev == NIN_SELECT || ev == NIN_KEYSELECT) { ShowMainWindow(); return; }
     if (ev != WM_CONTEXTMENU && ev != WM_RBUTTONUP) return;
     HMENU m = CreatePopupMenu();
@@ -4319,6 +5474,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (ch >= 0x20 && GetKeyState(VK_CONTROL) >= 0) TypeAhead(ch);
                 return 0;
             }
+            if (g_focus == Focus::Jump) {
+                if (g_jump.input.OnChar(ch)) JumpRefresh();
+                return 0;
+            }
             TextInput* in = g_focus == Focus::Search ? &T().filter : g_focus == Focus::Path ? &g_pathInput : &g_renameInput;
             if (in->OnChar(ch)) {
                 if (g_focus == Focus::Search) OnFilterChanged();
@@ -4328,6 +5487,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_TIMER:
             if (wp == TIMER_UPDATE_CHECK) { AutoUpdateOnTimer(); return 0; }
+            if (wp == TIMER_TOAST) { ExpireToasts(); return 0; }
+            if (wp == TIMER_ANIM) {
+                if ((int)(GetTickCount() - g_animUntil) >= 0) KillTimer(hwnd, TIMER_ANIM);
+                Redraw();
+                return 0;
+            }
             if (wp == TIMER_HEALTHY) { KillTimer(hwnd, TIMER_HEALTHY); AutoUpdateOnStarted(); return 0; }
             switch (wp) {
                 case TIMER_PREVIEW: KillTimer(hwnd, TIMER_PREVIEW); ShowHandlerNow(); return 0;
@@ -4355,7 +5520,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 case TIMER_CARET: {
                     if (g_focus == Focus::List) { KillTimer(hwnd, TIMER_CARET); g_caretTimer = false; return 0; }
-                    TextInput* in = g_focus == Focus::Search ? &T().filter : g_focus == Focus::Path ? &g_pathInput : &g_renameInput;
+                    TextInput* in = g_focus == Focus::Jump ? &g_jump.input : g_focus == Focus::Search ? &T().filter :
+                                    g_focus == Focus::Path ? &g_pathInput : &g_renameInput;
                     in->caretOn = !in->caretOn;
                     Redraw();
                     return 0;
@@ -4452,13 +5618,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SettingsClose();
                 return 0;
             }
-            if (QueueBusy() && MessageBoxW(hwnd, L"A file transfer is still running. Quit and cancel it?", L"Strata",
-                                           MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) return 0;
+            if (QueueBusy() && !ConfirmDialog(hwnd, L"A file transfer is still running", L"Quitting cancels it. Files already copied stay where they are.",
+                                              L"Quit and cancel", true)) return 0;
             QueueShutdown();
             SettingsClose();
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
+            VisitsSave(true);
             WatchFolder(hwnd, 0, L"");
             WatchFolder(hwnd, 1, L"");
             PreviewClear();
@@ -4585,7 +5752,10 @@ HWND MainCreate(HINSTANCE inst, const std::vector<std::wstring>& openPaths, bool
         for (auto& st : g_config.session) {
             std::wstring l = st.left.empty() || IsDirectory(st.left) || !ArchiveOf(st.left).empty() ? st.left : L"";
             std::wstring r2 = st.right.empty() || IsDirectory(st.right) || !ArchiveOf(st.right).empty() ? st.right : L"";
-            AddTab(l, false, -1, &r2, st.activePane);
+            int at = AddTab(l, false, -1, &r2, st.activePane);
+            g_tabs[at].locked = st.locked;
+            g_tabs[at].color = st.color;
+            g_tabs[at].born = 0;
         }
     int active = std::clamp(g_config.sessionActive, 0, std::max(0, (int)g_tabs.size() - 1));
     for (auto& p : openPaths) { MainOpenPath(p, true); active = (int)g_tabs.size() - 1; }

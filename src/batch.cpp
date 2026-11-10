@@ -1,6 +1,7 @@
 // Strata - batch rename with live preview
 #include "batch.h"
 #include "fs.h"
+#include "dialogs.h"
 #include <commctrl.h>
 #include <regex>
 #include <set>
@@ -139,6 +140,7 @@ static INT_PTR CALLBACK BatchProc(HWND dlg, UINT m, WPARAM w, LPARAM l) {
             SendMessageW(cb, CB_SETCURSEL, 0, 0);
             SetDlgItemTextW(dlg, IdStart, L"1");
             CheckDlgButton(dlg, IdExt, BST_CHECKED);
+            ThemeWin32Dialog(dlg);
             Recompute(dlg, st);
             SetFocus(GetDlgItem(dlg, IdFind));
             return FALSE;

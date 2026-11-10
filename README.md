@@ -3,12 +3,14 @@
 A fast, modern, keyboard-first File Explorer replacement for Windows.
 Part of the larosa023 suite of lightweight Windows apps (Foyer, Faderly, Ember, Tonely, Mantel, Marq, Lumora…).
 
-**Status: v0.2.0** — all six roadmap phases are in.
-- **Browsing:** dual pane with F5/F6, grid view, and a transfer queue with undo.
-- **Search:** whole-PC search with filters and saved searches.
-- **Folders and files:** background folder sizes, color tags, a preview panel with Git status, and archive browsing.
-- **Customization:** a settings window, themes shared with Foyer, and a cleaned-up right-click menu.
-- **System:** a built-in updater, installer or portable mode, and an optional default file manager mode.
+**Status: v0.3.0.** Strata has:
+- dual pane with F5/F6, a transfer queue with undo, and batch rename
+- whole-PC search with filters and saved searches
+- folder sizes and a **Space treemap**, color tags, and **version stacking** for `rev1/rev2/rev3` files
+- **What changed since my last visit**, a **quick look carousel**, **Jump to folder**, a **focus filter**, and **locked and colored tabs**
+- a preview panel with Git status, and archive browsing
+- themed dialogs, animations, and transfer-finished chimes and notifications
+- a built-in updater, installer or portable mode, and an optional default file manager mode
 
 ---
 
@@ -39,16 +41,20 @@ Command line: `Strata.exe "D:\Projects"` opens a folder in a new tab · `--tray`
 
 | | |
 |---|---|
-| **Panes** | **Tab** switches panes · **F5** copy / **F6** move the selection to the other pane · Ctrl+\\ toggles dual / single · Ctrl+G grid view · Ctrl+P preview panel · Ctrl+B sidebar |
-| **Tabs** | Ctrl+T new · Ctrl+W close · Ctrl+Shift+T reopen closed · Ctrl+Tab / Ctrl+PgUp/PgDn · Ctrl+1…9 · drag to reorder · middle-click to close |
-| **Navigate** | Enter or double-click opens (zips open like folders) · Backspace or Alt+↑ goes up · Alt+← / Alt+→ · Ctrl+L to type a path · type a name to jump to it |
-| **Search** | Ctrl+K. In a folder, typing filters and **Enter** searches subfolders. On This PC it searches every drive: through [Everything](https://www.voidtools.com/) if it's running, otherwise through Strata's own index. Right-click the results → **Save search** to make a smart folder |
+| **Panes** | **Tab** switches panes · **F5** copy / **F6** move the selection to the other pane · Ctrl+\\ dual / single · Ctrl+Shift+G grid · **Ctrl+Shift+S Space view** · Ctrl+P preview panel · Ctrl+B sidebar |
+| **Jump** | **Ctrl+G** opens a fuzzy search over the folders you use, most frequent and recent first. Type "smi bid" for `D:\Bids\2026\Smith Library`. Enter goes there, Ctrl+Enter opens a new tab, Shift+Enter uses the other pane |
+| **Quick look** | **Space** opens a big preview; **← →** flip through the folder; Enter opens the file; Space or Esc closes |
+| **Focus** | **Ctrl+Shift+F** shows only PDFs, drawings, Office files, images, recent changes, a tag, or the same type as the selection. The filter stays while you browse; Esc or the chip's ✕ shows everything again |
+| **What changed** | **Ctrl+Shift+H** lists every file in this folder and its subfolders changed since your last visit, today, this week, this month, or since a date |
+| **Versions** | `Plans_rev1/rev2/rev3.pdf`, `(2)`, `- Copy` and dated copies stack under the newest. Click "3 versions", or press → / ←, to expand or collapse |
+| **Tabs** | Ctrl+T new · Ctrl+W close · Ctrl+Shift+T reopen closed · Ctrl+Tab / Ctrl+1…9 · drag to reorder · right-click → **Lock tab to this folder** or **Tab color** |
+| **Navigate** | Enter or double-click opens (zips open like folders) · Backspace or Alt+↑ goes up · Alt+← / Alt+→ · Ctrl+L types a path · type a name to jump to it |
+| **Search** | Ctrl+K. In a folder, typing filters and **Enter** searches subfolders. On This PC it searches every drive: through [Everything](https://www.voidtools.com/) if it's running, otherwise through Strata's own index. Right-click → **Save search** for a smart folder |
 | **Files** | F2 rename (with several selected: **batch rename** with live preview) · Del → Recycle Bin · Shift+Del delete · Ctrl+C/X/V · **Ctrl+Z undo** · Ctrl+Shift+N new folder · Ctrl+Shift+C copy path · Alt+Enter properties · drag and drop anywhere |
-| **Preview** | Space for a quick look (images, text, PDF, Office, video, archives). Folders show what's taking space; Git repos show branch and changes |
-| **Transfers** | Ctrl+J opens the transfer queue: pause, resume, skip, cancel, speed and ETA |
-| **Tags** | Right-click → Tag. Click a tag in the sidebar to see everything with it. Edit tags in Settings → Tags |
-| **Sidebar** | Drag pins, drives, tags, saved searches — or whole section headers — to rearrange them (also Move up/down on right-click; right-click a header → Reset sidebar order). Click a header to collapse it |
-| **Settings** | Ctrl+, opens General, Layout, Themes, Search, Tags, File operations, Updates and About |
+| **Transfers** | Ctrl+J opens the queue (pause, resume, skip, cancel, speed and ETA). Long transfers end with a soft chime and an "Open folder" card |
+| **Tags** | Right-click → Tag. Click a tag in the sidebar to see everything with it |
+| **Sidebar** | Drag pins, drives, tags, saved searches or whole section headers to rearrange them. Click a header to collapse it |
+| **Settings** | Ctrl+, opens General, Layout (including animations and version stacking), Themes, Search, Tags, File operations (including sounds and notifications), Updates and About |
 
 ### Search filters
 
@@ -108,6 +114,10 @@ src/
   shell.cpp/.h      icons, Windows context menu (+ cleanup), IFileOperation, clipboard, launching
   queue.cpp/.h      transfer queue: CopyFileEx engine, pause/skip/cancel, verify, speed/ETA
   batch.cpp/.h      batch rename with live preview
+  dialogs.cpp/.h    themed dialogs (conflicts, confirmations, prompts) + theming for classic dialogs
+  visits.cpp/.h     folder visit history: Jump to folder and "since my last visit"
+  versions.cpp/.h   version stacking (rev1 / rev2 / Rev B / dated copies)
+  treemap.cpp/.h    squarified treemap layout for the Space view
   sizes.cpp/.h      background folder sizes (pauses when busy or gaming)
   tags.cpp/.h       color tags on files and folders
   dragdrop.cpp/.h   OLE drag and drop
@@ -135,7 +145,8 @@ res/                icon, manifest, version resource
 - [x] **Phase 4** — settings window, themes and theme files shared with Foyer, layout options, right-click menu cleanup
 - [x] **Phase 5** — built-in updater, installer and portable mode, default file manager with safe fallback, backup/restore
 - [x] **Phase 6** — archive browsing, Git status, high contrast and text scaling, grid view
-- [ ] Next: screen-reader (UI Automation) support, a network locations section in the sidebar, and a themed batch rename dialog
+- [x] **0.3** — version stacking, what changed since, Space view, quick look carousel, Jump to folder, focus filter, locked and colored tabs, animations, themed dialogs, transfer notifications
+- [ ] Next: screen-reader (UI Automation) support, a network locations section in the sidebar
 
 ## Build
 

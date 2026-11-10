@@ -2,6 +2,7 @@
 // shared with Foyer's settings so the suite looks the same.
 #include "common.h"
 #include "settings.h"
+#include "dialogs.h"
 #include "config.h"
 #include "gfx.h"
 #include "updater.h"
@@ -111,73 +112,8 @@ static std::wstring PickFile(bool save, const wchar_t* defName, const wchar_t* f
 }
 
 // ============================================================ text prompt
-namespace {  // file-local type (keeps it from clashing with same-named types in other files)
-struct PromptState { std::wstring title, prompt, value; bool ok = false; };
-}  // namespace
-
-static INT_PTR CALLBACK PromptProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    auto* st = (PromptState*)GetWindowLongPtrW(h, DWLP_USER);
-    switch (m) {
-        case WM_INITDIALOG: {
-            st = (PromptState*)l;
-            SetWindowLongPtrW(h, DWLP_USER, l);
-            SetWindowTextW(h, st->title.c_str());
-            SetDlgItemTextW(h, 100, st->prompt.c_str());
-            SetDlgItemTextW(h, 101, st->value.c_str());
-            HWND e = GetDlgItem(h, 101);
-            SendMessageW(e, EM_SETSEL, 0, -1);
-            SetFocus(e);
-            BOOL dark = gfx::BuildTheme(g_config).dark;
-            DwmSetWindowAttribute(h, 20, &dark, sizeof(dark));
-            return FALSE;
-        }
-        case WM_COMMAND:
-            if (LOWORD(w) == IDOK) {
-                wchar_t buf[512] = {};
-                GetDlgItemTextW(h, 101, buf, 512);
-                st->value = buf;
-                st->ok = true;
-                EndDialog(h, IDOK);
-                return TRUE;
-            }
-            if (LOWORD(w) == IDCANCEL) { EndDialog(h, IDCANCEL); return TRUE; }
-            break;
-    }
-    return FALSE;
-}
-
-// builds a DLGTEMPLATE in memory: label, edit box, OK, Cancel
 bool PromptText(HWND owner, const std::wstring& title, const std::wstring& prompt, std::wstring& value) {
-    std::vector<WORD> t;
-    auto align = [&] { while ((t.size() * 2) % 4) t.push_back(0); };
-    auto str = [&](const wchar_t* s) { while (*s) t.push_back(*s++); t.push_back(0); };
-    auto dw = [&](DWORD d) { t.push_back(LOWORD(d)); t.push_back(HIWORD(d)); };
-    dw(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU);
-    dw(0);
-    t.push_back(4);
-    t.push_back(0); t.push_back(0); t.push_back(240); t.push_back(74);
-    t.push_back(0); t.push_back(0);
-    str(L"");
-    t.push_back(9);
-    str(L"Segoe UI");
-    auto item = [&](DWORD style, short x, short y, short cx, short cy, WORD id, WORD cls, const wchar_t* text) {
-        align();
-        dw(style | WS_CHILD | WS_VISIBLE);
-        dw(0);
-        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy);
-        t.push_back(id);
-        t.push_back(0xFFFF); t.push_back(cls);
-        str(text);
-        t.push_back(0);
-    };
-    item(SS_LEFT, 8, 8, 224, 10, 100, 0x0082, L"");
-    item(ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 8, 22, 224, 14, 101, 0x0081, L"");
-    item(BS_DEFPUSHBUTTON | WS_TABSTOP, 128, 50, 50, 16, IDOK, 0x0080, L"OK");
-    item(BS_PUSHBUTTON | WS_TABSTOP, 182, 50, 50, 16, IDCANCEL, 0x0080, L"Cancel");
-    PromptState st{title, prompt, value};
-    DialogBoxIndirectParamW(GetModuleHandleW(nullptr), (LPCDLGTEMPLATEW)t.data(), owner, PromptProc, (LPARAM)&st);
-    if (st.ok) value = st.value;
-    return st.ok;
+    return TextDialog(owner, title, prompt, value, L"OK");
 }
 
 // ============================================================ pages
@@ -222,7 +158,7 @@ static void BuildGeneral(std::vector<Ctl>& v) {
                        [] { return DefaultFileManagerEnabled(); },
                        [](bool b) {
                            std::wstring err;
-                           if (!SetDefaultFileManager(b, &err)) MessageBoxW(g_hwnd, err.c_str(), L"Strata", MB_ICONWARNING);
+                           if (!SetDefaultFileManager(b, &err)) NoticeDialog(g_hwnd, L"Something went wrong", err, true);
                            Changed(false);
                        }));
     if (!CrashGuardMessage().empty()) v.push_back(Info(CrashGuardMessage()));
@@ -261,7 +197,10 @@ static void BuildLayout(std::vector<Ctl>& v) {
     v.push_back(Ctl{CType::LayoutGrid});
     v.push_back(Header(L"Show"));
     v.push_back(Toggle(L"Sidebar", L"Ctrl+B", [] { return g_config.showSidebar; }, [](bool b) { g_config.showSidebar = b; Changed(); }));
-    v.push_back(Toggle(L"Preview panel", L"Ctrl+P. Space shows a quick preview of the selected file.", [] { return g_config.showPreview; },
+    v.push_back(Toggle(L"Stack file versions", L"Plans_rev1, Plans_rev2 and Plans rev 3 show as one row with the newest on top. Click the "
+                       L"\"versions\" pill (or press →) to see the older ones.",
+                       [] { return g_config.stackVersions; }, [](bool b) { g_config.stackVersions = b; Changed(); }));
+    v.push_back(Toggle(L"Preview panel", L"Ctrl+P. Space opens a big quick look you can flip through with the arrow keys.", [] { return g_config.showPreview; },
                        [](bool b) { g_config.showPreview = b; Changed(); }));
     v.push_back(Toggle(L"Status bar", nullptr, [] { return g_config.showStatusBar; }, [](bool b) { g_config.showStatusBar = b; Changed(); }));
     v.push_back(Toggle(L"Back / forward / up buttons", nullptr, [] { return g_config.showNavButtons; }, [](bool b) { g_config.showNavButtons = b; Changed(); }));
@@ -334,7 +273,7 @@ static void BuildThemes(std::vector<Ctl>& v) {
                               std::wstring p = PickFile(false, L"", L"Theme files (*.json)\0*.json\0All files\0*.*\0", L"json");
                               if (p.empty()) return;
                               std::wstring err;
-                              if (ThemeImport(p, &err)) Changed(); else MessageBoxW(g_hwnd, err.c_str(), L"Strata", MB_ICONWARNING);
+                              if (ThemeImport(p, &err)) Changed(); else NoticeDialog(g_hwnd, L"Something went wrong", err, true);
                           }},
                          {L"Export\x2026", [] {
                               std::wstring p = PickFile(true, L"My theme.theme.json", L"Theme files (*.json)\0*.json\0", L"json");
@@ -342,13 +281,13 @@ static void BuildThemes(std::vector<Ctl>& v) {
                               std::wstring name = PathLeaf(p);
                               size_t dot = name.find(L'.');
                               if (dot != std::wstring::npos) name = name.substr(0, dot);
-                              MessageBoxW(g_hwnd, ThemeExport(p, name) ? L"Theme saved." : L"Couldn't save the theme.", L"Strata", MB_ICONINFORMATION);
+                              NoticeDialog(g_hwnd, ThemeExport(p, name) ? L"Theme saved" : L"Couldn't save the theme", L"", false);
                           }}}));
     if (GetFileAttributesW(FoyerConfigPath().c_str()) != INVALID_FILE_ATTRIBUTES)
         v.push_back(Buttons(L"Match Foyer", L"Copy the theme, accent color and background from Foyer.",
                             {{L"Use Foyer's theme", [] {
                                   std::wstring err;
-                                  if (ThemeImport(FoyerConfigPath(), &err)) Changed(); else MessageBoxW(g_hwnd, err.c_str(), L"Strata", MB_ICONWARNING);
+                                  if (ThemeImport(FoyerConfigPath(), &err)) Changed(); else NoticeDialog(g_hwnd, L"Something went wrong", err, true);
                               }}}, 0));
 }
 
@@ -402,8 +341,8 @@ static void BuildTags(std::vector<Ctl>& v) {
         Changed();
         BuildPage();
     }}, {L"Reset to defaults", [] {
-        if (MessageBoxW(g_hwnd, L"Replace your tags with Urgent, Active, Done and Repo? Items keep tags whose names still exist.", L"Strata",
-                        MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return;
+        if (!ConfirmDialog(g_hwnd, L"Reset tags?", L"Your tags are replaced with Urgent, Active, Done and Repo. Items keep tags whose names still exist.",
+                           L"Reset tags")) return;
         ConfigDefaultTags();
         Changed();
         BuildPage();
@@ -417,6 +356,11 @@ static void BuildFileOps(std::vector<Ctl>& v) {
     v.push_back(Choice(L"When a file already exists", nullptr, {L"Ask", L"Skip", L"Replace", L"Keep both"},
                        [] { return IndexOf(g_config.conflictDefault, {L"ask", L"skip", L"replace", L"keepboth"}); },
                        [](int i) { const wchar_t* o[] = {L"ask", L"skip", L"replace", L"keepboth"}; g_config.conflictDefault = o[i]; Changed(); }));
+    v.push_back(Toggle(L"Play a sound when a long transfer finishes", L"A soft chime when a copy or move that took more than 10 seconds is done.",
+                       [] { return g_config.soundOnFinish; }, [](bool b) { g_config.soundOnFinish = b; Changed(); }));
+    v.push_back(Toggle(L"Show a notification when a long transfer finishes", L"A small card in the corner with \"Open folder\", or a Windows notification "
+                       L"when Strata isn't in front.",
+                       [] { return g_config.notifyOnFinish; }, [](bool b) { g_config.notifyOnFinish = b; Changed(); }));
     v.push_back(Toggle(L"Skip files that can't be copied", L"Keep going and list the problems at the end instead of asking each time.",
                        [] { return g_config.skipErrors; }, [](bool b) { g_config.skipErrors = b; Changed(); }));
     v.push_back(Header(L"Deleting"));
@@ -479,8 +423,13 @@ static void BuildAbout(std::vector<Ctl>& v) {
     if (IsInstalledCopy()) {
         v.push_back(Buttons(L"Installed", L"Strata is installed for your account (Start menu, Apps & features).",
                             {{L"Uninstall\x2026", [] {
-                                  int r = MessageBoxW(g_hwnd, L"Uninstall Strata?\n\nYes removes Strata but keeps your settings, pins and tags.\n"
-                                                              L"No removes your settings too.", L"Strata", MB_YESNOCANCEL | MB_ICONQUESTION);
+                                  DlgSpec d;
+                                  d.heading = L"Uninstall Strata?";
+                                  d.body = L"Strata is removed from your programs folder, the Start menu and Apps & features.";
+                                  d.icon = DlgSpec::Question;
+                                  d.buttons = {{IDCANCEL, L"Cancel"}, {IDNO, L"Remove settings too", false, true}, {IDYES, L"Uninstall, keep settings", true}};
+                                  d.cancelId = IDCANCEL;
+                                  int r = ShowDialog(g_hwnd, d).id;
                                   if (r == IDCANCEL) return;
                                   UninstallStrata(r == IDYES);
                                   PostMessageW(AppWindow(), WM_CLOSE, 1, 0);
@@ -491,8 +440,9 @@ static void BuildAbout(std::vector<Ctl>& v) {
                             L"No admin rights needed.",
                             {{L"Install", [] {
                                   std::wstring err;
-                                  if (!InstallStrata(&err)) { MessageBoxW(g_hwnd, err.c_str(), L"Strata", MB_ICONWARNING); return; }
-                                  if (MessageBoxW(g_hwnd, L"Strata is installed. Switch to the installed copy now?", L"Strata", MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+                                  if (!InstallStrata(&err)) { NoticeDialog(g_hwnd, L"Strata couldn't be installed", err, true); return; }
+                                  if (ConfirmDialog(g_hwnd, L"Strata is installed", L"Switch to the installed copy now? Your tabs come back.", L"Switch now",
+                                                    false, DlgSpec::Info)) {
                                       std::wstring exe = InstallDir() + L"\\Strata.exe";
                                       PostMessageW(AppWindow(), WM_CLOSE, 1, 0);
                                       ShellExecuteW(nullptr, L"open", exe.c_str(), L"--wait-old", nullptr, SW_SHOWNORMAL);
@@ -503,8 +453,8 @@ static void BuildAbout(std::vector<Ctl>& v) {
                        [] { return IsPortable(); },
                        [](bool b) {
                            std::wstring err;
-                           if (!SetPortable(b, &err)) MessageBoxW(g_hwnd, err.c_str(), L"Strata", MB_ICONWARNING);
-                           else MessageBoxW(g_hwnd, L"Done. Restart Strata to use the new settings location.", L"Strata", MB_ICONINFORMATION);
+                           if (!SetPortable(b, &err)) NoticeDialog(g_hwnd, L"Something went wrong", err, true);
+                           else NoticeDialog(g_hwnd, L"Done", L"Restart Strata to use the new settings location.");
                            BuildPage();
                        }));
     v.push_back(Header(L"Your data"));
@@ -513,15 +463,15 @@ static void BuildAbout(std::vector<Ctl>& v) {
                               std::wstring p = PickFile(true, L"Strata-backup.json", L"Strata backup (*.json)\0*.json\0All files\0*.*\0", L"json");
                               if (p.empty()) return;
                               std::wstring err;
-                              if (ConfigBackupTo(p, &err)) MessageBoxW(g_hwnd, L"Backup saved.", L"Strata", MB_ICONINFORMATION);
-                              else MessageBoxW(g_hwnd, err.c_str(), L"Strata", MB_ICONWARNING);
+                              if (ConfigBackupTo(p, &err)) NoticeDialog(g_hwnd, L"Backup saved", L"");
+                              else NoticeDialog(g_hwnd, L"Something went wrong", err, true);
                           }},
                          {L"Restore\x2026", [] {
                               std::wstring p = PickFile(false, L"", L"Strata backup (*.json)\0*.json\0All files\0*.*\0", L"json");
                               if (p.empty()) return;
                               std::wstring err;
-                              if (ConfigRestoreFrom(p, &err)) { Changed(false); BuildPage(); MessageBoxW(g_hwnd, L"Settings restored.", L"Strata", MB_ICONINFORMATION); }
-                              else MessageBoxW(g_hwnd, err.c_str(), L"Strata", MB_ICONWARNING);
+                              if (ConfigRestoreFrom(p, &err)) { Changed(false); BuildPage(); NoticeDialog(g_hwnd, L"Settings restored", L""); }
+                              else NoticeDialog(g_hwnd, L"Something went wrong", err, true);
                           }}}));
     v.push_back(Buttons(L"Files", L"Settings live in config.json; strata.log helps diagnose problems.",
                         {{L"Open data folder", [] { ShellOpen(DataDir().c_str()); }},
@@ -1079,11 +1029,12 @@ static void Click(int ci, int part, float x) {
                 if (ChooseColorW(&cc)) tg.color = (GetRValue(cc.rgbResult) << 16) | (GetGValue(cc.rgbResult) << 8) | GetBValue(cc.rgbResult);
             } else if (part == 1) {
                 std::wstring name = tg.name;
-                if (PromptText(g_hwnd, L"Rename tag", L"Tag name:", name) && !name.empty()) tg.name = name;
+                if (TextDialog(g_hwnd, L"Rename tag", L"", name, L"Rename") && !name.empty()) tg.name = name;
             } else if (part == 2) {
                 size_t n = TagsFind(tg.id).size();
                 std::wstring q = L"Delete the tag \"" + tg.name + L"\"?" + (n ? L"\n\nIt will be removed from " + std::to_wstring(n) + L" item(s)." : L"");
-                if (MessageBoxW(g_hwnd, q.c_str(), L"Strata", MB_OKCANCEL | MB_ICONQUESTION) == IDOK) {
+                if (ConfirmDialog(g_hwnd, L"Delete the tag \"" + tg.name + L"\"?", n ? L"It will be removed from " + std::to_wstring(n) + L" item(s)." : L"",
+                                  L"Delete tag", true)) {
                     TagsRemoveTag(tg.id);
                     g_config.tags.erase(g_config.tags.begin() + c.index);
                 }

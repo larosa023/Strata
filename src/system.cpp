@@ -301,3 +301,21 @@ void TrayRemove() {
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     g_trayAdded = false;
 }
+
+static bool g_trayTemporary = false;
+
+void TrayNotify(HWND owner, const std::wstring& title, const std::wstring& body) {
+    if (!g_trayAdded) { TrayAdd(owner); g_trayTemporary = g_trayAdded; }
+    if (!g_trayAdded) return;
+    NOTIFYICONDATAW n = g_nid;
+    n.uFlags = NIF_INFO;
+    wcsncpy_s(n.szInfoTitle, title.c_str(), _TRUNCATE);
+    wcsncpy_s(n.szInfo, body.c_str(), _TRUNCATE);
+    n.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON | NIIF_NOSOUND | NIIF_RESPECT_QUIET_TIME;
+    n.hBalloonIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, 32, 32, 0);
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
+void TrayRemoveIfTemporary() {
+    if (g_trayTemporary) { TrayRemove(); g_trayTemporary = false; }
+}

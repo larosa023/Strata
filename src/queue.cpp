@@ -484,7 +484,11 @@ static void Worker() {
         else if (g_config.conflictDefault == L"skip") r.conflictAll = 1;
         else if (g_config.conflictDefault == L"keepboth") r.conflictAll = 2;
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        DWORD t0 = GetTickCount();
         r.Run();
+        result->ms = GetTickCount() - t0;
+        result->bytes = job->info.doneBytes;
+        result->files = job->info.doneFiles;
         result->cancelled = job->cancel;
         result->ok = !job->cancel && job->info.errors == 0;
         result->errors = job->info.errors;

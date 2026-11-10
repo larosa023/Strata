@@ -31,6 +31,9 @@ struct JobResult {
     std::vector<std::pair<std::wstring, std::wstring>> moved;   // (from, to) top-level items that now live at `to`
     std::vector<std::wstring> created;                           // top-level items a copy created
     size_t errors = 0, skipped = 0;
+    uint64_t bytes = 0;      // total bytes transferred
+    size_t files = 0;
+    DWORD ms = 0;            // how long it took
 };
 
 // Questions the worker asks the UI (sent synchronously with WM_STRATA_QUEUEASK, lParam = QueueAsk*)

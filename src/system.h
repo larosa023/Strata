@@ -31,3 +31,6 @@ bool SetPortable(bool on, std::wstring* error);
 void TrayAdd(HWND owner);
 void TrayRemove();
 void TrayOnMessage(HWND owner, LPARAM lParam);
+// Windows notification from the tray icon (adds the icon for a while if it isn't there)
+void TrayNotify(HWND owner, const std::wstring& title, const std::wstring& body);
+void TrayRemoveIfTemporary();

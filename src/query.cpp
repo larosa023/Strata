@@ -59,6 +59,9 @@ SearchQuery ParseQuery(const std::wstring& text) {
             else if (!val.empty() && val[0] == L'>') q.minSize = ParseSize(val.substr(1)) + 1;
             else if (!val.empty() && val[0] == L'<') q.maxSize = ParseSize(val.substr(1));
             else if (!val.empty()) { uint64_t s = ParseSize(val); q.minSize = s * 9 / 10; q.maxSize = s * 11 / 10; }
+        } else if (key == L"since") {   // since:<unix seconds> (used by "What changed")
+            uint64_t secs = (uint64_t)_wtoi64(val.c_str());
+            if (secs) q.modifiedAfter = secs * 10000000ULL + 116444736000000000ULL;
         } else if (key == L"modified" || key == L"dm" || key == L"date") {
             const uint64_t day = 864000000000ull;
             if (val == L"today") q.modifiedAfter = NowFt() - day;

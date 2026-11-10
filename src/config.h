@@ -23,6 +23,8 @@ struct SavedSearch {
 struct SessionTab {
     std::wstring left, right;
     int activePane = 0;
+    bool locked = false;      // a locked tab stays on its folder (navigating opens a new tab)
+    uint32_t color = 0;       // tab color (0 = none)
 };
 
 // Column ids, in default display order
@@ -115,6 +117,9 @@ struct Config {
     std::vector<SessionTab> session;
     int sessionActive = 0;
     bool restoreSession = true;
+    bool stackVersions = true;            // Plans_rev1 / rev2 / rev3 collapse into one row
+    bool soundOnFinish = true;            // soft chime when a long transfer finishes
+    bool notifyOnFinish = true;           // toast (and a Windows notification when Strata isn't in front)
 };
 
 extern Config g_config;

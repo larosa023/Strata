@@ -1,5 +1,6 @@
 // Strata - wiring between the reusable updater module and the app
 #include "autoupdate.h"
+#include "dialogs.h"
 #include "config.h"
 #include "queue.h"
 #include <ctime>
@@ -81,7 +82,7 @@ void AutoUpdateInstallNow() {
     bool ok = updater::InstallAndRestart([] { if (g_releaseAppForUpdate) g_releaseAppForUpdate(); }, &error);
     if (!ok) {
         Log(L"Update install failed: %ls", error.c_str());
-        MessageBoxW(g_owner, (L"Strata couldn't install the update.\n\n" + error).c_str(), L"Strata", MB_ICONWARNING);
+        NoticeDialog(g_owner, L"Strata couldn't install the update", error, true);
     }
 }
 

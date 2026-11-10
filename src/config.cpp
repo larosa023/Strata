@@ -110,6 +110,7 @@ static const BoolField kBools[] = {
     {L"skipErrors", &Config::skipErrors}, {L"useEverything", &Config::useEverything}, {L"useIndex", &Config::useIndex},
     {L"searchNetwork", &Config::searchNetwork}, {L"keepInTray", &Config::keepInTray}, {L"defaultFileManager", &Config::defaultFileManager},
     {L"autoCheck", &Config::autoCheck}, {L"autoInstall", &Config::autoInstall}, {L"restoreSession", &Config::restoreSession},
+    {L"stackVersions", &Config::stackVersions}, {L"soundOnFinish", &Config::soundOnFinish}, {L"notifyOnFinish", &Config::notifyOnFinish},
 };
 
 static const StrField kStrs[] = {
@@ -199,7 +200,8 @@ static void FromJson(const json::Value& root) {
             for (auto& v : tabs->arr) {
                 if (v.type == json::Value::String) c.session.push_back({v.s, v.s, 0});   // 0.1.x format
                 else if (v.type == json::Value::Object)
-                    c.session.push_back({v.GetStr(L"left"), v.GetStr(L"right"), std::clamp((int)v.GetNum(L"active", 0), 0, 1)});
+                    c.session.push_back({v.GetStr(L"left"), v.GetStr(L"right"), std::clamp((int)v.GetNum(L"active", 0), 0, 1),
+                                         v.GetNum(L"locked", 0) != 0, (uint32_t)v.GetNum(L"color", 0)});
             }
         }
         c.sessionActive = (int)s->GetNum(L"active", 0);
@@ -275,6 +277,8 @@ static json::Value ToJson() {
         o.Set(L"left", Value::Str(t.left));
         o.Set(L"right", Value::Str(t.right));
         o.Set(L"active", Value::Num(t.activePane));
+        if (t.locked) o.Set(L"locked", Value::Num(1));
+        if (t.color) o.Set(L"color", Value::Num(t.color));
         tabs.arr.push_back(o);
     }
     s.Set(L"tabs", tabs);
