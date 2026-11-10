@@ -74,6 +74,9 @@ struct Config {
     int sortColumn = ColName;
     bool sortDescending = false;
     std::vector<std::wstring> recentFolders;
+    std::vector<std::wstring> sidebarOrder;       // section ids: pinned, drives, tags, saved, recent (dragged into place)
+    std::vector<std::wstring> sidebarCollapsed;   // collapsed section ids
+    std::vector<std::wstring> driveOrder;         // drive roots in the order the user dragged them (others follow)
 
     // ---- Folder sizes
     bool folderSizes = true;

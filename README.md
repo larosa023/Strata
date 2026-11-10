@@ -47,6 +47,7 @@ Command line: `Strata.exe "D:\Projects"` opens a folder in a new tab · `--tray`
 | **Preview** | Space for a quick look (images, text, PDF, Office, video, archives). Folders show what's taking space; Git repos show branch and changes |
 | **Transfers** | Ctrl+J opens the transfer queue: pause, resume, skip, cancel, speed and ETA |
 | **Tags** | Right-click → Tag. Click a tag in the sidebar to see everything with it. Edit tags in Settings → Tags |
+| **Sidebar** | Drag pins, drives, tags, saved searches — or whole section headers — to rearrange them (also Move up/down on right-click; right-click a header → Reset sidebar order). Click a header to collapse it |
 | **Settings** | Ctrl+, opens General, Layout, Themes, Search, Tags, File operations, Updates and About |
 
 ### Search filters

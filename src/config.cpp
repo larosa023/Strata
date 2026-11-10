@@ -182,6 +182,9 @@ static void FromJson(const json::Value& root) {
     for (int i = 0; i < ColCount; ++i) if (sort == kColNames[i]) c.sortColumn = i;
     c.sortDescending = root.GetBool(L"sortDescending", false);
     c.recentFolders = StrList(root.Get(L"recentFolders"));
+    c.sidebarOrder = StrList(root.Get(L"sidebarOrder"));
+    c.sidebarCollapsed = StrList(root.Get(L"sidebarCollapsed"));
+    c.driveOrder = StrList(root.Get(L"driveOrder"));
     c.hiddenMenuItems = StrList(root.Get(L"hiddenMenuItems"));
     c.seenMenuItems = StrList(root.Get(L"seenMenuItems"));
 
@@ -252,6 +255,9 @@ static json::Value ToJson() {
     root.Set(L"sortBy", Value::Str(kColNames[c.sortColumn]));
     root.Set(L"sortDescending", Value::Boolean(c.sortDescending));
     root.Set(L"recentFolders", StrArray(c.recentFolders));
+    root.Set(L"sidebarOrder", StrArray(c.sidebarOrder));
+    root.Set(L"sidebarCollapsed", StrArray(c.sidebarCollapsed));
+    root.Set(L"driveOrder", StrArray(c.driveOrder));
     root.Set(L"hiddenMenuItems", StrArray(c.hiddenMenuItems));
     root.Set(L"seenMenuItems", StrArray(c.seenMenuItems));
 

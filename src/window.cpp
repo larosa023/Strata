@@ -141,7 +141,7 @@ static bool g_caretTimer = false;
 
 // mouse drags
 namespace {  // file-local type (keeps it from clashing with same-named types in other files)
-enum class Drag { None, Tab, Splitter, Column, Scrollbar, Marquee, InputSelect, ListPress, PaneSplit, PreviewSplit };
+enum class Drag { None, SidePress, Tab, Splitter, Column, Scrollbar, Marquee, InputSelect, ListPress, PaneSplit, PreviewSplit };
 }  // namespace
 static Drag g_drag = Drag::None;
 static int g_dragIdx = -1;
@@ -1424,8 +1424,88 @@ static void PaintToolbar() {
 }
 
 // ============================================================ sidebar
-static bool g_sideCollapsed[6] = {false, false, false, true, false, false};   // pinned, drives, tags, recent, saved, -
-static void ToggleSidebarSection(int i) { if (i >= 0 && i < 6) g_sideCollapsed[i] = !g_sideCollapsed[i]; }
+// Sections: 0 pinned, 1 drives, 2 tags, 3 recent, 4 saved searches. Order and collapsed state are saved in config.
+static const wchar_t* kSideId[5] = {L"pinned", L"drives", L"tags", L"recent", L"saved"};
+static const wchar_t* kSideLabel[5] = {L"PINNED", L"DRIVES", L"TAGS", L"RECENT", L"SAVED SEARCHES"};
+static std::vector<int> SidebarOrder() {
+    std::vector<int> order;
+    for (auto& id : g_config.sidebarOrder)
+        for (int i = 0; i < 5; ++i)
+            if (id == kSideId[i] && std::find(order.begin(), order.end(), i) == order.end()) order.push_back(i);
+    for (int i : {0, 1, 2, 4, 3}) if (std::find(order.begin(), order.end(), i) == order.end()) order.push_back(i);
+    return order;
+}
+static void SetSidebarOrder(const std::vector<int>& order) {
+    g_config.sidebarOrder.clear();
+    for (int i : order) g_config.sidebarOrder.push_back(kSideId[i]);
+    ConfigSave();
+}
+static bool SideCollapsed(int i) {
+    for (auto& id : g_config.sidebarCollapsed) if (id == kSideId[i]) return true;
+    return false;
+}
+static void ToggleSidebarSection(int i) {
+    if (i < 0 || i >= 5) return;
+    auto& v = g_config.sidebarCollapsed;
+    auto it = std::find(v.begin(), v.end(), std::wstring(kSideId[i]));
+    if (it != v.end()) v.erase(it); else v.push_back(kSideId[i]);
+    ConfigSave();
+}
+// Drives follow the order the user dragged them into; new drives go at the end in letter order.
+static void SortDrives(std::vector<DriveInfo>& drives) {
+    auto rank = [&](const DriveInfo& d) {
+        for (size_t i = 0; i < g_config.driveOrder.size(); ++i)
+            if (_wcsicmp(g_config.driveOrder[i].c_str(), d.root.c_str()) == 0) return (int)i;
+        return 1000 + (int)towupper(d.root.empty() ? L'Z' : d.root[0]);
+    };
+    std::stable_sort(drives.begin(), drives.end(), [&](const DriveInfo& a, const DriveInfo& b) { return rank(a) < rank(b); });
+}
+// Sidebar drag-to-reorder: what is being dragged and where it would land
+struct SideDrag { ZoneKind kind = ZNone; int from = -1; int to = -1; float lineY = -1; };
+static SideDrag g_sideDrag;
+static int SideItemCount(ZoneKind k) {
+    switch (k) {
+        case ZSidePin: return (int)g_config.pins.size();
+        case ZSideDrive: return (int)g_drives.size();
+        case ZSideTag: return (int)g_config.tags.size();
+        case ZSideSaved: return (int)g_config.savedSearches.size();
+        case ZSideSection: return 5;
+        default: return 0;
+    }
+}
+static bool SideReorderable(ZoneKind k) { return k == ZSidePin || k == ZSideDrive || k == ZSideTag || k == ZSideSaved || k == ZSideSection; }
+template <class V> static void MoveElem(V& v, int from, int to) {
+    if (from < 0 || from >= (int)v.size() || to < 0 || to > (int)v.size()) return;
+    auto e = std::move(v[from]);
+    v.erase(v.begin() + from);
+    if (to > from) --to;
+    v.insert(v.begin() + to, std::move(e));
+}
+// Moves item `from` so it lands before position `to` (0..count) of the same list.
+static void SideMove(ZoneKind k, int from, int to) {
+    if (from == to || from + 1 == to) return;
+    switch (k) {
+        case ZSidePin: MoveElem(g_config.pins, from, to); break;
+        case ZSideTag: MoveElem(g_config.tags, from, to); break;
+        case ZSideSaved: MoveElem(g_config.savedSearches, from, to); break;
+        case ZSideDrive: {
+            MoveElem(g_drives, from, to);
+            g_config.driveOrder.clear();
+            for (auto& d : g_drives) g_config.driveOrder.push_back(d.root);
+            break;
+        }
+        case ZSideSection: {   // from/to are positions in the displayed order
+            auto order = SidebarOrder();
+            MoveElem(order, from, to);
+            SetSidebarOrder(order);
+            Redraw();
+            return;
+        }
+        default: return;
+    }
+    ConfigSave();
+    Redraw();
+}
 
 static void PaintSidebar() {
     float top = kTitleH + kToolH, bottom = g_H - (g_config.showStatusBar ? kStatusH : 0);
@@ -1456,102 +1536,116 @@ static void PaintSidebar() {
         g_cv.Text(L"This PC", g_fUi, R(r.left + 38, r.top, r.right - 8, r.bottom), g_theme.text);
         y += 36;
     }
-    auto section = [&](int idx, const wchar_t* label) {
+    // Section headers carry their display position in the zone's pane field (used for dragging sections)
+    int sectionPos = 0;
+    auto section = [&](int idx) {
         D2D1_RECT_F r = R(8, y, w - 8, y + 26);
         AddZone(ZSideSection, idx, r);
-        g_cv.Text(label, g_fSection, R(20, y, w - 30, y + 26), Hot(ZSideSection, idx) ? g_theme.text : g_theme.subtext);
-        g_cv.Glyph(g_sideCollapsed[idx] ? 0xE76C : 0xE70D, g_fIconSmall, R(w - 30, y, w - 12, y + 26), Alpha(g_theme.subtext, Hot(ZSideSection, idx) ? 1.0f : 0.5f));
+        bool dragging = g_sideDrag.kind == ZSideSection && g_sideDrag.from == sectionPos;
+        if (dragging) g_cv.FillRound(r, 6, Alpha(g_theme.accent, 0.12f));
+        g_cv.Text(kSideLabel[idx], g_fSection, R(20, y, w - 30, y + 26), Hot(ZSideSection, idx) || dragging ? g_theme.text : g_theme.subtext);
+        g_cv.Glyph(SideCollapsed(idx) ? 0xE76C : 0xE70D, g_fIconSmall, R(w - 30, y, w - 12, y + 26), Alpha(g_theme.subtext, Hot(ZSideSection, idx) ? 1.0f : 0.5f));
         y += 26;
-        return !g_sideCollapsed[idx];
+        return !SideCollapsed(idx);
     };
+    auto dragDim = [&](ZoneKind k, int i) { return g_sideDrag.kind == k && g_sideDrag.from == i; };
     int folderIcon = FolderIconIndex();
-    // Pinned
-    if (section(0, L"PINNED")) {
-    if (g_config.pins.empty()) {
-        g_cv.Text(L"Right-click a folder → Pin", g_fSmall, R(20, y, w - 8, y + 26), Alpha(g_theme.subtext, 0.7f));
-        y += 28;
-    }
-    for (int i = 0; i < (int)g_config.pins.size(); ++i) {
-        const Pin& p = g_config.pins[i];
-        D2D1_RECT_F r = R(8, y, w - 8, y + 32);
-        AddZone(ZSidePin, i, r);
-        bool cur = !t.path.empty() && _wcsicmp(t.path.c_str(), p.path.c_str()) == 0;
-        rowBg(r, cur, Hot(ZSidePin, i));
-        DrawItemIcon(folderIcon, r.left + 10, (r.top + r.bottom) / 2, 16);
-        float textRight = r.right - (p.color ? 22 : 8);
-        std::wstring name = p.name.empty() ? PathLeaf(p.path) : p.name;
-        g_cv.Text(name, g_fUi, R(r.left + 38, r.top, textRight, r.bottom), g_theme.text);
-        if (p.color) g_cv.Circle(r.right - 12, (r.top + r.bottom) / 2, 4, Rgb(p.color));
-        y += 34;
-    }
-    }
-    // Drives
-    y += 6;
-    if (section(1, L"DRIVES"))
-    for (int i = 0; i < (int)g_drives.size(); ++i) {
-        const DriveInfo& d = g_drives[i];
-        D2D1_RECT_F r = R(8, y, w - 8, y + 50);
-        AddZone(ZSideDrive, i, r);
-        bool cur = !t.path.empty() && t.path.size() >= 3 && _wcsnicmp(t.path.c_str(), d.root.c_str(), 3) == 0;
-        rowBg(r, cur && t.path.size() == 3, Hot(ZSideDrive, i));
-        DrawItemIcon(d.icon, r.left + 10, r.top + 17, 16);
-        g_cv.Text(DriveDisplayName(d), g_fUi, R(r.left + 38, r.top + 4, r.right - 8, r.top + 28), g_theme.text);
-        if (d.ready && d.total) {
-            float used = 1.0f - (float)((double)d.freeBytes / (double)d.total);
-            D2D1_RECT_F bar = R(r.left + 38, r.top + 30, r.right - 10, r.top + 34);
-            g_cv.FillRound(bar, 2, g_theme.surfaceStrong);
-            D2D1_COLOR_F c = used > 0.9f ? Rgb(0xE5484D) : used > 0.8f ? Rgb(0xF5A524) : g_theme.accent;
-            g_cv.FillRound(R(bar.left, bar.top, bar.left + (bar.right - bar.left) * std::clamp(used, 0.02f, 1.0f), bar.bottom), 2, c);
-            g_cv.Text(FormatSize(d.freeBytes) + L" free of " + FormatSize(d.total), g_fSmall, R(r.left + 38, r.top + 34, r.right - 8, r.bottom - 1),
-                      g_theme.subtext);
-        } else {
-            g_cv.Text(L"Not ready", g_fSmall, R(r.left + 38, r.top + 30, r.right - 8, r.bottom - 4), g_theme.subtext);
-        }
-        y += 52;
-    }
-    // Tags
-    if (g_config.sidebarTags && !g_config.tags.empty()) {
-        y += 6;
-        if (section(2, L"TAGS"))
+    bool first = true;
+    for (int sec : SidebarOrder()) {
+        bool shown = sec == 0 || sec == 1 || (sec == 2 && g_config.sidebarTags && !g_config.tags.empty()) ||
+                     (sec == 4 && g_config.sidebarSaved && !g_config.savedSearches.empty()) ||
+                     (sec == 3 && g_config.sidebarRecent && !g_config.recentFolders.empty());
+        if (!shown) { ++sectionPos; continue; }
+        if (!first) y += 6;
+        first = false;
+        bool open = section(sec);
+        ++sectionPos;
+        if (!open) continue;
+        if (sec == 0) {
+            if (g_config.pins.empty()) {
+                g_cv.Text(L"Right-click a folder → Pin", g_fSmall, R(20, y, w - 8, y + 26), Alpha(g_theme.subtext, 0.7f));
+                y += 28;
+            }
+            for (int i = 0; i < (int)g_config.pins.size(); ++i) {
+                const Pin& p = g_config.pins[i];
+                D2D1_RECT_F r = R(8, y, w - 8, y + 32);
+                AddZone(ZSidePin, i, r);
+                bool cur = !t.path.empty() && _wcsicmp(t.path.c_str(), p.path.c_str()) == 0;
+                rowBg(r, cur || dragDim(ZSidePin, i), Hot(ZSidePin, i));
+                DrawItemIcon(folderIcon, r.left + 10, (r.top + r.bottom) / 2, 16);
+                float textRight = r.right - (p.color ? 22 : 8);
+                std::wstring name = p.name.empty() ? PathLeaf(p.path) : p.name;
+                g_cv.Text(name, g_fUi, R(r.left + 38, r.top, textRight, r.bottom), g_theme.text);
+                if (p.color) g_cv.Circle(r.right - 12, (r.top + r.bottom) / 2, 4, Rgb(p.color));
+                y += 34;
+            }
+        } else if (sec == 1) {
+            for (int i = 0; i < (int)g_drives.size(); ++i) {
+                const DriveInfo& d = g_drives[i];
+                D2D1_RECT_F r = R(8, y, w - 8, y + 50);
+                AddZone(ZSideDrive, i, r);
+                bool cur = !t.path.empty() && t.path.size() >= 3 && _wcsnicmp(t.path.c_str(), d.root.c_str(), 3) == 0;
+                rowBg(r, (cur && t.path.size() == 3) || dragDim(ZSideDrive, i), Hot(ZSideDrive, i));
+                DrawItemIcon(d.icon, r.left + 10, r.top + 17, 16);
+                g_cv.Text(DriveDisplayName(d), g_fUi, R(r.left + 38, r.top + 4, r.right - 8, r.top + 28), g_theme.text);
+                if (d.ready && d.total) {
+                    float used = 1.0f - (float)((double)d.freeBytes / (double)d.total);
+                    D2D1_RECT_F bar = R(r.left + 38, r.top + 30, r.right - 10, r.top + 34);
+                    g_cv.FillRound(bar, 2, g_theme.surfaceStrong);
+                    D2D1_COLOR_F c = used > 0.9f ? Rgb(0xE5484D) : used > 0.8f ? Rgb(0xF5A524) : g_theme.accent;
+                    g_cv.FillRound(R(bar.left, bar.top, bar.left + (bar.right - bar.left) * std::clamp(used, 0.02f, 1.0f), bar.bottom), 2, c);
+                    g_cv.Text(FormatSize(d.freeBytes) + L" free of " + FormatSize(d.total), g_fSmall, R(r.left + 38, r.top + 34, r.right - 8, r.bottom - 1),
+                              g_theme.subtext);
+                } else {
+                    g_cv.Text(L"Not ready", g_fSmall, R(r.left + 38, r.top + 30, r.right - 8, r.bottom - 4), g_theme.subtext);
+                }
+                y += 52;
+            }
+        } else if (sec == 2) {
             for (int i = 0; i < (int)g_config.tags.size(); ++i) {
                 const TagDef& tg = g_config.tags[i];
                 D2D1_RECT_F r = R(8, y, w - 8, y + 30);
                 AddZone(ZSideTag, i, r);
-                rowBg(r, t.tagFilter == tg.id, Hot(ZSideTag, i));
+                rowBg(r, t.tagFilter == tg.id || dragDim(ZSideTag, i), Hot(ZSideTag, i));
                 g_cv.Circle(r.left + 18, (r.top + r.bottom) / 2, 5, Rgb(tg.color));
                 g_cv.Text(tg.name, g_fUi, R(r.left + 38, r.top, r.right - 8, r.bottom), g_theme.text);
                 y += 32;
             }
-    }
-    // Saved searches (smart folders)
-    if (g_config.sidebarSaved && !g_config.savedSearches.empty()) {
-        y += 6;
-        if (section(4, L"SAVED SEARCHES"))
+        } else if (sec == 4) {
             for (int i = 0; i < (int)g_config.savedSearches.size(); ++i) {
                 const SavedSearch& ss = g_config.savedSearches[i];
                 D2D1_RECT_F r = R(8, y, w - 8, y + 30);
                 AddZone(ZSideSaved, i, r);
                 bool cur = t.searchActive && t.searchQuery == ss.query && _wcsicmp(t.path.c_str(), ss.root.c_str()) == 0;
-                rowBg(r, cur, Hot(ZSideSaved, i));
+                rowBg(r, cur || dragDim(ZSideSaved, i), Hot(ZSideSaved, i));
                 g_cv.Glyph(0xE721, g_fIcon, R(r.left + 8, r.top, r.left + 30, r.bottom), g_theme.accent);
                 g_cv.Text(ss.name, g_fUi, R(r.left + 38, r.top, r.right - 8, r.bottom), g_theme.text);
                 y += 32;
             }
-    }
-    // Recent folders
-    if (g_config.sidebarRecent && !g_config.recentFolders.empty()) {
-        y += 6;
-        if (section(3, L"RECENT"))
+        } else if (sec == 3) {
             for (int i = 0; i < (int)g_config.recentFolders.size() && i < 10; ++i) {
                 const std::wstring& rp = g_config.recentFolders[i];
                 D2D1_RECT_F r = R(8, y, w - 8, y + 30);
                 AddZone(ZSideRecent, i, r);
                 rowBg(r, false, Hot(ZSideRecent, i));
-                DrawItemIcon(folderIcon, r.left + 10, (r.top + r.bottom) / 2, 16, 0.85f);
-                g_cv.Text(PathLeaf(rp), g_fUi, R(r.left + 38, r.top, r.right - 8, r.bottom), g_theme.text);
+                // a drive root shows as "Data3 (F:)" rather than "F:"
+                auto dn = rp.size() <= 3 ? g_driveNames.find(rp.size() == 2 ? rp + L"\\" : rp) : g_driveNames.end();
+                bool isDrive = dn != g_driveNames.end();
+                if (isDrive) {
+                    int icon = -1;
+                    for (auto& d : g_drives) if (_wcsicmp(d.root.c_str(), dn->first.c_str()) == 0) icon = d.icon;
+                    DrawItemIcon(icon >= 0 ? icon : folderIcon, r.left + 10, (r.top + r.bottom) / 2, 16, 0.85f);
+                } else {
+                    DrawItemIcon(folderIcon, r.left + 10, (r.top + r.bottom) / 2, 16, 0.85f);
+                }
+                g_cv.Text(isDrive ? dn->second : PathLeaf(rp), g_fUi, R(r.left + 38, r.top, r.right - 8, r.bottom), g_theme.text);
                 y += 32;
             }
+        }
     }
+    // insertion line while dragging
+    if (g_sideDrag.kind != ZNone && g_sideDrag.lineY >= 0)
+        g_cv.FillRound(R(12, g_sideDrag.lineY - 1.5f, w - 12, g_sideDrag.lineY + 1.5f), 1.5f, g_theme.accent);
     g_sideContentH = y + g_sideScroll - top + 8;
     g_rt->PopAxisAlignedClip();
 }
@@ -2128,14 +2222,50 @@ static void PinColorMenu(int pinIdx, POINT pt) {
 }
 
 static void SidebarMenu(ZoneKind k, int idx, POINT pt) {
+    if (k == ZSideSection) {
+        auto order = SidebarOrder();
+        int pos = (int)(std::find(order.begin(), order.end(), idx) - order.begin());
+        HMENU m = CreatePopupMenu();
+        AppendMenuW(m, MF_STRING, 1, SideCollapsed(idx) ? L"Expand" : L"Collapse");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING | (pos == 0 ? MF_GRAYED : 0), 2, L"Move section up");
+        AppendMenuW(m, MF_STRING | (pos + 1 >= (int)order.size() ? MF_GRAYED : 0), 3, L"Move section down");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, 4, L"Reset sidebar order");
+        AppendMenuW(m, MF_GRAYED, 0, L"Tip: drag headers and items to rearrange");
+        UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+        DestroyMenu(m);
+        if (cmd == 1) ToggleSidebarSection(idx);
+        if (cmd == 2) SideMove(ZSideSection, pos, pos - 1);
+        if (cmd == 3) SideMove(ZSideSection, pos, pos + 2);
+        if (cmd == 4) {
+            g_config.sidebarOrder.clear();
+            g_config.driveOrder.clear();
+            SortDrives(g_drives);
+            ConfigSave();
+        }
+        Redraw();
+        return;
+    }
+    int count = SideItemCount(k);
+    auto addMoves = [&](HMENU m) {
+        AppendMenuW(m, MF_STRING | (idx == 0 ? MF_GRAYED : 0), 30, L"Move up");
+        AppendMenuW(m, MF_STRING | (idx + 1 >= count ? MF_GRAYED : 0), 31, L"Move down");
+    };
+    auto doMoves = [&](UINT cmd) {
+        if (cmd == 30) SideMove(k, idx, idx - 1);
+        if (cmd == 31) SideMove(k, idx, idx + 2);
+    };
     if (k == ZSideTag || k == ZSideSaved) {
         HMENU m = CreatePopupMenu();
         AppendMenuW(m, MF_STRING, 1, L"Open");
         AppendMenuW(m, MF_STRING, 2, L"Open in new tab");
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        addMoves(m);
         AppendMenuW(m, MF_STRING, 3, k == ZSideTag ? L"Edit tags in Settings…" : L"Remove saved search");
         UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
         DestroyMenu(m);
+        doMoves(cmd);
         if (cmd == 1) { if (k == ZSideTag) ShowTag(T(), g_config.tags[idx].id); else RunSavedSearch(idx, false); }
         if (cmd == 2) {
             AddTab(L"", true, g_active + 1);
@@ -2169,6 +2299,7 @@ static void SidebarMenu(ZoneKind k, int idx, POINT pt) {
         AppendMenuW(m, MF_STRING, 15, L"Remove from recent");
         AppendMenuW(m, MF_STRING, 16, L"Clear recent folders");
     } else {
+        addMoves(m);
         AppendMenuW(m, MF_STRING, 20, L"Properties");
     }
     AppendMenuW(m, MF_STRING | (DualMode() ? 0 : MF_GRAYED), 5, L"Open in other pane");
@@ -2180,6 +2311,7 @@ static void SidebarMenu(ZoneKind k, int idx, POINT pt) {
         case 3: OpenTerminal(path); break;
         case 4: CopyPathsToClipboard({path}); break;
         case 10: PinColorMenu(idx, pt); break;
+        case 30: case 31: doMoves(cmd); break;
         case 11: std::swap(g_config.pins[idx], g_config.pins[idx - 1]); ConfigSave(); break;
         case 12: std::swap(g_config.pins[idx], g_config.pins[idx + 1]); ConfigSave(); break;
         case 13: g_config.pins.erase(g_config.pins.begin() + idx); ConfigSave(); break;
@@ -2795,7 +2927,8 @@ static void OnLButtonDown(float x, float y, bool dbl) {
         case ZMenu: case ZSearchClear: case ZCrumb: case ZCrumbArrow: case ZCrumbOverflow: case ZSideThisPC: case ZSidePin: case ZSideDrive:
         case ZViewSwitch: case ZUpdatePill: case ZQueueStatus: case ZQueueJobPause: case ZQueueJobCancel: case ZQueueClear: case ZQueueClose:
         case ZPreviewButton: case ZSideTag: case ZSideSaved: case ZSideRecent: case ZSideSection: case ZPreviewToggle:
-            g_drag = Drag::None;
+            g_drag = SideReorderable(z.kind) ? Drag::SidePress : Drag::None;
+            g_sideDrag = SideDrag{};
             g_dragIdx = z.idx;
             if (z.kind == ZQueueJobPause || z.kind == ZQueueJobCancel || z.kind == ZQueueClear) g_queueTouched = true;
             return;   // acted on in button-up
@@ -2900,6 +3033,40 @@ static void OnMouseMove(float x, float y) {
     if (std::fabs(x - g_dragStartX) > 4 || std::fabs(y - g_dragStartY) > 4) g_dragMoved = true;
     Pane& t = T();
     switch (g_drag) {
+        case Drag::SidePress: {
+            if (!g_dragMoved) return;
+            ZoneKind k = g_pressKind;
+            auto order = SidebarOrder();
+            auto posOf = [&](int idx) { return k == ZSideSection ? (int)(std::find(order.begin(), order.end(), idx) - order.begin()) : idx; };
+            g_sideDrag.kind = k;
+            g_sideDrag.from = posOf(g_dragIdx);
+            // insertion point: before the first item (of the same kind) whose middle is below the cursor
+            int to = -1;
+            float lineY = -1, lastBottom = -1;
+            int lastPos = -1;
+            for (auto& zz : g_zones) {
+                if (zz.kind != k) continue;
+                int pos = posOf(zz.idx);
+                if (to < 0 && y < (zz.rc.top + zz.rc.bottom) / 2) { to = pos; lineY = zz.rc.top - 1; }
+                if (pos > lastPos) { lastPos = pos; lastBottom = zz.rc.bottom + 1; }
+            }
+            if (to < 0) { to = lastPos + 1; lineY = lastBottom; }
+            if (k == ZSideSection) {   // sections land after the whole (possibly expanded) section above
+                if (to > 0 && to <= (int)order.size()) {
+                    float headerY = -1;
+                    for (auto& zz : g_zones) if (zz.kind == ZSideSection && posOf(zz.idx) == to) headerY = zz.rc.top - 3;
+                    if (headerY >= 0) lineY = headerY;
+                    else lineY = g_sideContentH + kTitleH + kToolH - g_sideScroll;
+                }
+                if (to >= (int)order.size()) to = (int)order.size();
+            }
+            bool noop = to == g_sideDrag.from || to == g_sideDrag.from + 1;
+            g_sideDrag.to = to;
+            g_sideDrag.lineY = noop ? -1 : lineY;
+            SetCursor(LoadCursorW(nullptr, IDC_SIZENS));
+            Redraw();
+            return;
+        }
         case Drag::Tab: {
             if (!g_dragMoved) return;
             float left, tabW;
@@ -2983,6 +3150,14 @@ static void OnLButtonUp(float x, float y) {
     Pane& t = T();
     if (was == Drag::Splitter || was == Drag::Column || was == Drag::PaneSplit || was == Drag::PreviewSplit) { ConfigSave(); Redraw(); return; }
     if (was == Drag::Tab || was == Drag::Scrollbar || was == Drag::Marquee || was == Drag::InputSelect) { Redraw(); return; }
+    if (was == Drag::SidePress && g_sideDrag.kind != ZNone) {
+        SideDrag sd = g_sideDrag;
+        g_sideDrag = SideDrag{};
+        g_pressKind = ZNone;
+        if (sd.to >= 0) SideMove(sd.kind, sd.from, sd.to);
+        Redraw();
+        return;
+    }
     if (was == Drag::ListPress) {
         if (!g_dragMoved && g_pressWasSelected && g_pressRow >= 0 && g_pressRow < (int)t.view.size()) SelectOnly(t, g_pressRow);
         g_pressRow = -1;
@@ -3100,7 +3275,7 @@ static void OnRightClick(float x, float y) {
     Pane& t = T();
     switch (z.kind) {
         case ZTab: case ZTabClose: TabMenu(z.idx, pt); break;
-        case ZSidePin: case ZSideDrive: case ZSideTag: case ZSideSaved: case ZSideRecent: SidebarMenu(z.kind, z.idx, pt); break;
+        case ZSidePin: case ZSideDrive: case ZSideTag: case ZSideSaved: case ZSideRecent: case ZSideSection: SidebarMenu(z.kind, z.idx, pt); break;
         case ZHeader: case ZHeaderDiv: HeaderMenu(pt); break;
         case ZList: {
             if (g_focus != Focus::List) SetFocusTo(Focus::List);
@@ -3275,6 +3450,7 @@ static void OnIcons(IconBatch* b) {
 }
 
 static void OnDrives(std::vector<DriveInfo>* d) {
+    SortDrives(*d);
     bool changed = d->size() != g_drives.size();
     for (size_t i = 0; !changed && i < d->size(); ++i) changed = (*d)[i].root != g_drives[i].root || (*d)[i].ready != g_drives[i].ready;
     g_drives = std::move(*d);
