@@ -5,29 +5,9 @@
 #include <map>
 #include <algorithm>
 
-// ============================================================ query matching (built-in scan)
-struct Matcher {
-    std::vector<std::wstring> words;   // lowercase; every word must match (like Everything)
-    bool Init(const std::wstring& q) {
-        std::wstring cur;
-        for (wchar_t c : ToLower(q)) {
-            if (c == L' ' || c == L'\t') { if (!cur.empty()) words.push_back(cur); cur.clear(); }
-            else if (c != L'"') cur += c;
-        }
-        if (!cur.empty()) words.push_back(cur);
-        return !words.empty();
-    }
-    bool Match(const std::wstring& nameLower) const {
-        for (auto& w : words) {
-            if (w.find_first_of(L"*?") != std::wstring::npos) {
-                if (!PathMatchSpecW(nameLower.c_str(), w.c_str())) return false;
-            } else if (nameLower.find(w) == std::wstring::npos) {
-                return false;
-            }
-        }
-        return true;
-    }
-};
+#include "query.h"
+#include "index.h"
+#include "config.h"
 
 static std::vector<std::wstring> AllDriveRoots() {
     std::vector<std::wstring> roots;
@@ -37,7 +17,7 @@ static std::vector<std::wstring> AllDriveRoots() {
     UINT oldMode = SetErrorMode(SEM_FAILCRITICALERRORS);
     for (wchar_t* p = buf; *p; p += wcslen(p) + 1) {
         UINT t = GetDriveTypeW(p);
-        if (t != DRIVE_FIXED && t != DRIVE_REMOVABLE) continue;   // network shares are left out of "everywhere"
+        if (t != DRIVE_FIXED && t != DRIVE_REMOVABLE && !(t == DRIVE_REMOTE && g_config.searchNetwork)) continue;
         ULARGE_INTEGER a, b, c;
         if (GetDiskFreeSpaceExW(p, &a, &b, &c)) roots.push_back(p);
     }
@@ -48,8 +28,7 @@ static std::vector<std::wstring> AllDriveRoots() {
 static void ScanThread(HWND notify, int tab, uint64_t gen, std::vector<std::wstring> roots, std::wstring query) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-    Matcher m;
-    m.Init(query);
+    SearchQuery m = ParseQuery(query);
     if (roots.empty()) roots = AllDriveRoots();
 
     auto* batch = new SearchBatch;
@@ -88,7 +67,8 @@ static void ScanThread(HWND notify, int tab, uint64_t gen, std::vector<std::wstr
             if (isDir && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && nm[0] != L'$' &&
                 _wcsicmp(nm, L"System Volume Information") != 0)
                 stack.push_back(full);
-            if (!m.Match(ToLower(nm))) continue;
+            uint64_t fsz = isDir ? 0 : ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            if (!m.Match(ToLower(nm), isDir, fsz, fd.ftLastWriteTime)) continue;
             Item it;
             it.name = nm;
             it.path = full;
@@ -131,6 +111,7 @@ static void ScanThread(HWND notify, int tab, uint64_t gen, std::vector<std::wstr
 #define EVERYTHING_SORT_NAME_ASCENDING 1
 
 #pragma pack(push, 1)
+namespace {  // file-local type (keeps it from clashing with same-named types in other files)
 struct EvQuery2 {
     DWORD reply_hwnd;
     DWORD reply_copydata_message;
@@ -141,8 +122,13 @@ struct EvQuery2 {
     DWORD sort_type;
     // followed by the search string (UTF-16, NUL terminated)
 };
+}  // namespace
+namespace {  // file-local type (keeps it from clashing with same-named types in other files)
 struct EvList2 { DWORD totitems, numitems, offset, request_flags, sort_type; };
+}  // namespace
+namespace {  // file-local type (keeps it from clashing with same-named types in other files)
 struct EvItem2 { DWORD flags, data_offset; };
+}  // namespace
 #pragma pack(pop)
 
 static HWND EverythingWindow() {
@@ -166,7 +152,7 @@ static bool EverythingQuery(HWND notify, int tab, uint64_t gen, const std::vecto
         if (r.back() != L'\\') r += L'\\';
         q = L"\"" + r + L"\" ";   // a path ending in \ limits the search to that folder and below
     }
-    q += query;
+    q += ParseQuery(query).ToEverything();
     std::vector<BYTE> buf(sizeof(EvQuery2) + (q.size() + 1) * sizeof(wchar_t));
     auto* hdr = reinterpret_cast<EvQuery2*>(buf.data());
     g_evReplyId = 0x53540000u | (DWORD)(gen & 0xFFFF);
@@ -257,8 +243,33 @@ bool SearchHandleCopyData(HWND notify, const COPYDATASTRUCT* cds) {
 }
 
 // ============================================================ entry
+static void IndexThread(HWND notify, int tab, uint64_t gen, std::vector<std::wstring> roots, std::wstring query) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    auto* batch = new SearchBatch;
+    batch->tab = tab;
+    batch->gen = gen;
+    batch->done = true;
+    bool capped = false;
+    std::vector<Item> items;
+    if (!IndexQuery(roots, ParseQuery(query), kSearchMaxResults, items, capped)) { delete batch; ScanThread(notify, tab, gen, roots, query); CoUninitialize(); return; }
+    std::map<std::wstring, int> typeIdx;
+    for (auto& it : items) {
+        std::wstring tn;
+        TypeAndIcon(it.name, it.isDir(), tn, it.icon);
+        auto ti = typeIdx.find(tn);
+        if (ti == typeIdx.end()) { ti = typeIdx.emplace(tn, (int)batch->typeNames.size()).first; batch->typeNames.push_back(tn); }
+        it.type = ti->second;
+    }
+    batch->items = std::move(items);
+    batch->capped = capped;
+    batch->fromIndex = true;
+    if (!Superseded(tab, gen) && !PostMessageW(notify, WM_STRATA_SEARCH, 0, (LPARAM)batch)) delete batch;
+    CoUninitialize();
+}
+
 void SearchAsync(HWND notify, int tab, uint64_t gen, const std::vector<std::wstring>& roots, const std::wstring& query) {
     MarkLatest(tab, gen);
-    if (EverythingQuery(notify, tab, gen, roots, query)) return;
+    if (g_config.useEverything && EverythingQuery(notify, tab, gen, roots, query)) return;
+    if (IndexReady()) { std::thread(IndexThread, notify, tab, gen, roots, query).detach(); return; }
     std::thread(ScanThread, notify, tab, gen, roots, query).detach();
 }

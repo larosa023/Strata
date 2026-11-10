@@ -8,6 +8,7 @@
 #include <map>
 #include <unordered_map>
 #include <algorithm>
+#include <functional>
 
 // ---------------------------------------------------------------- path helpers
 static bool IsDriveRoot(const std::wstring& p) { return p.size() == 3 && p[1] == L':' && p[2] == L'\\'; }
@@ -145,7 +146,9 @@ static std::wstring ExtLower(const std::wstring& name);
 static std::wstring ExtLowerOf(const std::wstring& name) { return ExtLower(name); }
 
 // ---------------------------------------------------------------- type + icon cache
+namespace {  // file-local type (keeps it from clashing with same-named types in other files)
 struct TypeInfo { std::wstring name; int icon = -1; };
+}  // namespace
 static std::mutex g_typeLock;
 static std::unordered_map<std::wstring, TypeInfo> g_typeCache;   // key: lowercase extension, "<dir>"
 
@@ -260,6 +263,98 @@ void ListDrivesAsync(HWND notify) {
     }).detach();
 }
 
+// ---------------------------------------------------------------- archives (browsed through the Windows shell)
+bool IsArchiveFile(const std::wstring& path) {
+    std::wstring e = ExtLower(path);
+    return e == L".zip" || e == L".7z" || e == L".rar" || e == L".tar" || e == L".tgz" || e == L".gz" || e == L".bz2" ||
+           e == L".xz" || e == L".cab" || e == L".tbz2" || e == L".txz";
+}
+
+// If `path` is an archive file or a folder inside one, returns the archive file's path.
+std::wstring ArchiveOf(const std::wstring& path) {
+    std::vector<std::wstring> full;
+    SplitPath(path, &full);
+    for (auto& p : full) {
+        DWORD a = GetFileAttributesW(p.c_str());
+        if (a == INVALID_FILE_ATTRIBUTES) return L"";       // past the archive: the rest is virtual
+        if (!(a & FILE_ATTRIBUTE_DIRECTORY)) return IsArchiveFile(p) ? p : L"";
+    }
+    return L"";
+}
+
+static void ListViaShell(const std::wstring& folder, Listing* L, const std::function<int(const std::wstring&)>& typeOf) {
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    HRESULT hr = SHParseDisplayName(folder.c_str(), nullptr, &pidl, 0, nullptr);
+    if (FAILED(hr) || !pidl) { L->error = ERROR_NOT_SUPPORTED; return; }
+    IShellFolder* desktop = nullptr;
+    IShellFolder2* sf = nullptr;
+    SHGetDesktopFolder(&desktop);
+    if (desktop) desktop->BindToObject(pidl, nullptr, IID_PPV_ARGS(&sf));
+    if (!sf) { L->error = ERROR_NOT_SUPPORTED; if (desktop) desktop->Release(); CoTaskMemFree(pidl); return; }
+    IEnumIDList* en = nullptr;
+    if (SUCCEEDED(sf->EnumObjects(nullptr, SHCONTF_FOLDERS | SHCONTF_NONFOLDERS | SHCONTF_INCLUDEHIDDEN, &en)) && en) {
+        PITEMID_CHILD child = nullptr;
+        while (en->Next(1, &child, nullptr) == S_OK) {
+            Item it;
+            STRRET sr;
+            if (SUCCEEDED(sf->GetDisplayNameOf(child, SHGDN_INFOLDER | SHGDN_FORPARSING, &sr))) {
+                wchar_t* nm = nullptr;
+                if (SUCCEEDED(StrRetToStrW(&sr, child, &nm))) { it.name = nm; CoTaskMemFree(nm); }
+            }
+            SFGAOF attrs = SFGAO_FOLDER;
+            sf->GetAttributesOf(1, (PCUITEMID_CHILD_ARRAY)&child, &attrs);
+            bool dir = (attrs & SFGAO_FOLDER) != 0;
+            it.attrs = dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+            VARIANT v;
+            VariantInit(&v);
+            SHCOLUMNID sizeKey{{0xB725F130, 0x47EF, 0x101A, {0xA5, 0xF1, 0x02, 0x60, 0x8C, 0x9E, 0xEB, 0xAC}}, 12};   // PKEY_Size
+            SHCOLUMNID dateKey{{0xB725F130, 0x47EF, 0x101A, {0xA5, 0xF1, 0x02, 0x60, 0x8C, 0x9E, 0xEB, 0xAC}}, 14};   // PKEY_DateModified
+            if (!dir && SUCCEEDED(sf->GetDetailsEx(child, &sizeKey, &v))) {
+                if (v.vt == VT_UI8) it.size = v.ullVal;
+                else if (v.vt == VT_UI4) it.size = v.ulVal;
+                else if (v.vt == VT_I8) it.size = (uint64_t)v.llVal;
+            }
+            VariantClear(&v);
+            if (SUCCEEDED(sf->GetDetailsEx(child, &dateKey, &v)) && v.vt == VT_DATE) {
+                SYSTEMTIME st;
+                VariantTimeToSystemTime(v.date, &st);
+                FILETIME local;
+                SystemTimeToFileTime(&st, &local);
+                LocalFileTimeToFileTime(&local, &it.modified);
+            }
+            VariantClear(&v);
+            if (!it.name.empty()) {
+                std::wstring ext = dir ? L"" : ExtLower(it.name);
+                TypeInfo ti = LookupType(ext, dir);
+                it.type = typeOf(ti.name);
+                it.icon = ti.icon;
+                L->items.push_back(std::move(it));
+            }
+            CoTaskMemFree(child);
+        }
+        en->Release();
+    }
+    sf->Release();
+    desktop->Release();
+    CoTaskMemFree(pidl);
+}
+
+std::vector<std::wstring> ListArchiveNames(const std::wstring& archive) {
+    Listing L;
+    std::map<std::wstring, int> idx;
+    ListViaShell(archive, &L, [&](const std::wstring& n) {
+        auto it = idx.find(n);
+        if (it != idx.end()) return it->second;
+        int i = (int)L.types.size();
+        L.types.push_back(n);
+        idx[n] = i;
+        return i;
+    });
+    std::vector<std::wstring> out;
+    for (auto& it : L.items) out.push_back(it.name);
+    return out;
+}
+
 // ---------------------------------------------------------------- folder listing
 static std::mutex g_genLock;
 static std::map<int, uint64_t> g_latestGen;   // tab -> latest requested generation
@@ -302,7 +397,10 @@ void ListFolderAsync(HWND notify, int tab, uint64_t gen, const std::wstring& fol
         };
         std::vector<int> special;
 
-        if (folder.empty()) {
+        L->archive = ArchiveOf(folder);
+        if (!L->archive.empty()) {
+            ListViaShell(folder, L, typeOf);
+        } else if (folder.empty()) {
             // This PC: drives as rows
             for (auto& d : EnumDrives()) {
                 Item it;
@@ -379,21 +477,25 @@ void ListFolderAsync(HWND notify, int tab, uint64_t gen, const std::wstring& fol
     }).detach();
 }
 
-// ---------------------------------------------------------------- folder watcher
-static std::atomic<uint64_t> g_watchGen{0};
-static HANDLE g_watchStop = nullptr;
+// ---------------------------------------------------------------- folder watchers (one per pane slot)
+static std::atomic<uint64_t> g_watchGen[2];
+static HANDLE g_watchStop[2] = {nullptr, nullptr};
+static std::wstring g_watchPath[2];
 
-uint64_t WatchGeneration() { return g_watchGen.load(); }
+uint64_t WatchGeneration(int slot) { return g_watchGen[slot & 1].load(); }
 
-void WatchFolder(HWND notify, const std::wstring& folder) {
-    if (g_watchStop) { SetEvent(g_watchStop); CloseHandle(g_watchStop); g_watchStop = nullptr; }
-    uint64_t gen = ++g_watchGen;
+void WatchFolder(HWND notify, int slot, const std::wstring& folder) {
+    slot &= 1;
+    if (_wcsicmp(g_watchPath[slot].c_str(), folder.c_str()) == 0 && (g_watchStop[slot] || folder.empty())) return;
+    g_watchPath[slot] = folder;
+    if (g_watchStop[slot]) { SetEvent(g_watchStop[slot]); CloseHandle(g_watchStop[slot]); g_watchStop[slot] = nullptr; }
+    uint64_t gen = ++g_watchGen[slot];
     if (folder.empty()) return;
     HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE stopForThread = nullptr;
     DuplicateHandle(GetCurrentProcess(), stop, GetCurrentProcess(), &stopForThread, 0, FALSE, DUPLICATE_SAME_ACCESS);
-    g_watchStop = stop;
-    std::thread([notify, folder, gen, stopForThread] {
+    g_watchStop[slot] = stop;
+    std::thread([notify, folder, gen, slot, stopForThread] {
         HANDLE ch = FindFirstChangeNotificationW(folder.c_str(), FALSE,
             FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE |
             FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_ATTRIBUTES);
@@ -402,8 +504,8 @@ void WatchFolder(HWND notify, const std::wstring& folder) {
             while (true) {
                 DWORD r = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
                 if (r != WAIT_OBJECT_0 + 1) break;
-                if (g_watchGen.load() != gen) break;
-                PostMessageW(notify, WM_STRATA_DIRCHANGED, (WPARAM)gen, 0);
+                if (g_watchGen[slot].load() != gen) break;
+                PostMessageW(notify, WM_STRATA_DIRCHANGED, (WPARAM)gen, (LPARAM)slot);
                 if (!FindNextChangeNotification(ch)) break;
             }
             FindCloseChangeNotification(ch);

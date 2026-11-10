@@ -23,6 +23,7 @@ struct Listing {
     std::vector<Item> items;
     std::vector<std::wstring> types; // type names ("File folder", "PDF Document", ...)
     DWORD error = 0;                 // Win32 error if the folder couldn't be read
+    std::wstring archive;            // set when this folder is inside an archive (zip, 7z, ...)
     double ms = 0;                   // time taken
 };
 
@@ -48,9 +49,10 @@ void ListDrivesAsync(HWND notify);
 // Drive display name, e.g. "Local Disk (C:)"
 std::wstring DriveDisplayName(const DriveInfo& d);
 
-// Watch one folder for changes; posts WM_STRATA_DIRCHANGED(gen). Empty path stops watching.
-void WatchFolder(HWND notify, const std::wstring& folder);
-uint64_t WatchGeneration();
+// Watch a folder for changes in one of two slots (one per pane); posts WM_STRATA_DIRCHANGED(gen, slot).
+// An empty path stops watching that slot.
+void WatchFolder(HWND notify, int slot, const std::wstring& folder);
+uint64_t WatchGeneration(int slot);
 
 // Path helpers
 std::wstring PathJoin(const std::wstring& dir, const std::wstring& name);
@@ -61,6 +63,9 @@ bool IsDirectory(const std::wstring& path);
 std::vector<std::wstring> SplitPath(const std::wstring& path, std::vector<std::wstring>* fullPaths);
 std::vector<std::wstring> ListSubfolders(const std::wstring& folder, size_t max, bool includeHidden);
 int FolderIconIndex();
+bool IsArchiveFile(const std::wstring& path);
+std::wstring ArchiveOf(const std::wstring& path);   // the archive file if `path` is in / is one
+std::vector<std::wstring> ListArchiveNames(const std::wstring& archive);   // top-level entries
 void TypeAndIcon(const std::wstring& name, bool dir, std::wstring& typeName, int& icon);
 // Generation tracking shared by folder listings and searches (a newer request for a tab cancels older ones)
 void MarkLatest(int tab, uint64_t gen);

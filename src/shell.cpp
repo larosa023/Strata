@@ -9,6 +9,10 @@
 #include <wincodec.h>
 #include <thread>
 #include <unordered_map>
+#include <set>
+#include <map>
+#include <propkey.h>
+#include "config.h"
 
 template <class T> static void Rel(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
@@ -60,6 +64,7 @@ ID2D1Bitmap* IconBitmap(ID2D1RenderTarget* rt, int index) {
 }
 
 // ============================================================ PIDL helpers
+namespace {  // file-local type (keeps it from clashing with same-named types in other files)
 struct PidlSet {
     IShellFolder* parent = nullptr;
     std::vector<PIDLIST_ABSOLUTE> abs;
@@ -81,6 +86,7 @@ struct PidlSet {
         return true;
     }
 };
+}  // namespace
 
 template <class T>
 static T* GetUIObject(HWND owner, const std::vector<std::wstring>& paths, REFIID iid) {
@@ -360,6 +366,22 @@ bool OpenItem(HWND owner, const std::wstring& path, std::wstring* folderTarget) 
     return true;
 }
 
+bool CreateShortcutIn(const std::wstring& target, const std::wstring& folder) {
+    IShellLinkW* link = nullptr;
+    IPersistFile* pf = nullptr;
+    bool ok = false;
+    std::wstring leaf = PathLeaf(target);
+    std::wstring lnk = PathJoin(folder, UniqueName(folder, leaf + L" - Shortcut", L".lnk"));
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)))) {
+        link->SetPath(target.c_str());
+        link->SetWorkingDirectory(PathParent(target).c_str());
+        if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&pf)))) ok = SUCCEEDED(pf->Save(lnk.c_str(), TRUE));
+    }
+    Rel(pf);
+    Rel(link);
+    return ok;
+}
+
 void OpenTerminal(const std::wstring& folder) {
     if (folder.empty()) return;
     std::wstring args = L"-d \"" + folder + (folder.back() == L'\\' ? L"\\\"" : L"\"");
@@ -388,6 +410,124 @@ void ShowProperties(HWND owner, const std::vector<std::wstring>& paths) {
     InvokeVerb(owner, paths, "properties");
 }
 
+// ============================================================ recycle bin restore
+size_t RestoreFromRecycleBin(HWND owner, const std::vector<std::wstring>& originalPaths) {
+    if (originalPaths.empty()) return 0;
+    std::set<std::wstring> want;
+    for (auto& p : originalPaths) want.insert(ToLower(p));
+    PIDLIST_ABSOLUTE binPidl = nullptr;
+    if (FAILED(SHGetKnownFolderIDList(FOLDERID_RecycleBinFolder, 0, nullptr, &binPidl))) return 0;
+    IShellFolder* desktop = nullptr;
+    IShellFolder2* bin = nullptr;
+    SHGetDesktopFolder(&desktop);
+    if (desktop) desktop->BindToObject(binPidl, nullptr, IID_PPV_ARGS(&bin));
+    size_t restored = 0;
+    if (bin) {
+        // newest deletion per original path wins
+        struct Hit { PITEMID_CHILD child; double when; };
+        std::map<std::wstring, Hit> hits;
+        IEnumIDList* en = nullptr;
+        if (SUCCEEDED(bin->EnumObjects(owner, SHCONTF_FOLDERS | SHCONTF_NONFOLDERS | SHCONTF_INCLUDEHIDDEN, &en)) && en) {
+            PITEMID_CHILD child = nullptr;
+            const SHCOLUMNID kFrom{{0x9B174B33, 0x40FF, 0x11D2, {0xA2, 0x7E, 0x00, 0xC0, 0x4F, 0xC3, 0x08, 0x71}}, 2};
+            const SHCOLUMNID kWhen{{0x9B174B33, 0x40FF, 0x11D2, {0xA2, 0x7E, 0x00, 0xC0, 0x4F, 0xC3, 0x08, 0x71}}, 3};
+            while (en->Next(1, &child, nullptr) == S_OK) {
+                VARIANT from, when;
+                VariantInit(&from);
+                VariantInit(&when);
+                std::wstring folderFrom, name;
+                if (SUCCEEDED(bin->GetDetailsEx(child, &kFrom, &from)) && from.vt == VT_BSTR) folderFrom = from.bstrVal;
+                STRRET sr;
+                if (SUCCEEDED(bin->GetDisplayNameOf(child, SHGDN_INFOLDER, &sr))) {
+                    wchar_t* nm = nullptr;
+                    if (SUCCEEDED(StrRetToStrW(&sr, child, &nm))) { name = nm; CoTaskMemFree(nm); }
+                }
+                double t = 0;
+                if (SUCCEEDED(bin->GetDetailsEx(child, &kWhen, &when)) && when.vt == VT_DATE) t = when.date;
+                VariantClear(&from);
+                VariantClear(&when);
+                std::wstring key = ToLower(PathJoin(folderFrom, name));
+                bool keep = false;
+                if (want.count(key)) {
+                    auto it = hits.find(key);
+                    if (it == hits.end() || it->second.when < t) {
+                        if (it != hits.end()) CoTaskMemFree(it->second.child);
+                        hits[key] = {child, t};
+                        keep = true;
+                    }
+                }
+                // Recycle Bin display names may hide extensions; also try matching without them
+                if (!keep && !name.empty()) {
+                    for (auto& w : want) {
+                        if (ToLower(PathParent(w)) != ToLower(folderFrom)) continue;
+                        std::wstring leaf = PathLeaf(w);
+                        size_t dot = leaf.find_last_of(L'.');
+                        if (dot != std::wstring::npos && _wcsicmp(leaf.substr(0, dot).c_str(), name.c_str()) == 0) {
+                            auto it = hits.find(w);
+                            if (it == hits.end() || it->second.when < t) {
+                                if (it != hits.end()) CoTaskMemFree(it->second.child);
+                                hits[w] = {child, t};
+                                keep = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (!keep) CoTaskMemFree(child);
+            }
+            en->Release();
+        }
+        if (!hits.empty()) {
+            std::vector<PCUITEMID_CHILD> kids;
+            for (auto& h : hits) kids.push_back(h.second.child);
+            IContextMenu* cm = nullptr;
+            if (SUCCEEDED(bin->GetUIObjectOf(owner, (UINT)kids.size(), kids.data(), IID_IContextMenu, nullptr, (void**)&cm)) && cm) {
+                HMENU m = CreatePopupMenu();
+                cm->QueryContextMenu(m, 0, 1, 0x7FFF, CMF_NORMAL);
+                CMINVOKECOMMANDINFO ci{sizeof(ci)};
+                ci.hwnd = owner;
+                ci.lpVerb = "undelete";
+                ci.nShow = SW_SHOWNORMAL;
+                if (SUCCEEDED(cm->InvokeCommand(&ci))) restored = kids.size();
+                DestroyMenu(m);
+                cm->Release();
+            }
+            for (auto& h : hits) CoTaskMemFree(h.second.child);
+        }
+        bin->Release();
+    }
+    if (desktop) desktop->Release();
+    CoTaskMemFree(binPidl);
+    return restored;
+}
+
+bool ExtractToTemp(HWND owner, const std::wstring& path, std::wstring& out) {
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring dir = std::wstring(tmp) + L"Strata\\" + std::to_wstring(GetTickCount());
+    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+    IFileOperation* op = nullptr;
+    IShellItem *src = nullptr, *dst = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&op));
+    if (SUCCEEDED(hr)) hr = SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&src));
+    if (SUCCEEDED(hr)) hr = SHCreateItemFromParsingName(dir.c_str(), nullptr, IID_PPV_ARGS(&dst));
+    if (SUCCEEDED(hr)) {
+        op->SetOwnerWindow(owner);
+        op->SetOperationFlags(FOF_NOCONFIRMATION | FOF_NOCONFIRMMKDIR | FOF_SILENT);
+        hr = op->CopyItem(src, dst, nullptr, nullptr);
+        if (SUCCEEDED(hr)) hr = op->PerformOperations();
+    }
+    Rel(src);
+    Rel(dst);
+    Rel(op);
+    out = PathJoin(dir, PathLeaf(path));
+    return SUCCEEDED(hr) && GetFileAttributesW(out.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+void ShellCopyOut(HWND owner, const std::vector<std::wstring>& sources, const std::wstring& destFolder) {
+    FileOpAsync(owner, OpKind::Copy, sources, destFolder);
+}
+
 // ============================================================ context menu
 static IContextMenu2* g_cm2 = nullptr;
 static IContextMenu3* g_cm3 = nullptr;
@@ -405,9 +545,63 @@ bool ShellMenuHandleMessage(UINT msg, WPARAM wp, LPARAM lp, LRESULT* result) {
 
 constexpr UINT kShellFirst = 1, kShellLast = 0x6FFF, kExtraBase = 0x7000;
 
+static std::wstring CleanLabel(const wchar_t* raw) {
+    std::wstring out;
+    for (const wchar_t* p = raw; *p; ++p) {
+        if (*p == L'\t') break;
+        if (*p == L'&') { if (p[1] == L'&') { out += L'&'; ++p; } continue; }
+        out += *p;
+    }
+    while (!out.empty() && (out.back() == L' ' || out.back() == L'.' || out.back() == 0x2026)) out.pop_back();
+    return out;
+}
+
+void ContextMenuSeen(std::vector<std::wstring>& out) { out = g_config.seenMenuItems; }
+
+// Removes Windows menu entries the user chose to hide, and remembers the entries seen (for Settings).
+static void CleanShellMenu(HMENU menu, UINT firstShellPos) {
+    std::set<std::wstring> hidden;
+    for (auto& h : g_config.hiddenMenuItems) hidden.insert(ToLower(h));
+    bool seenChanged = false;
+    for (int i = GetMenuItemCount(menu) - 1; i >= (int)firstShellPos; --i) {
+        wchar_t buf[256] = {};
+        MENUITEMINFOW mi{sizeof(mi)};
+        mi.fMask = MIIM_FTYPE | MIIM_STRING | MIIM_ID;
+        mi.dwTypeData = buf;
+        mi.cch = 255;
+        if (!GetMenuItemInfoW(menu, i, TRUE, &mi)) continue;
+        if (mi.fType & (MFT_SEPARATOR | MFT_OWNERDRAW)) {
+            if (!(mi.fType & MFT_SEPARATOR) || !buf[0]) {}
+            if (mi.fType & MFT_SEPARATOR) continue;
+        }
+        std::wstring label = CleanLabel(buf);
+        if (label.empty()) continue;
+        if (hidden.count(ToLower(label))) { DeleteMenu(menu, i, MF_BYPOSITION); continue; }
+        bool known = false;
+        for (auto& s : g_config.seenMenuItems) if (_wcsicmp(s.c_str(), label.c_str()) == 0) { known = true; break; }
+        if (!known && mi.wID < 0x7000) {
+            g_config.seenMenuItems.push_back(label);
+            if (g_config.seenMenuItems.size() > 150) g_config.seenMenuItems.erase(g_config.seenMenuItems.begin());
+            seenChanged = true;
+        }
+    }
+    // tidy separators left behind
+    bool prevSep = true;
+    for (int i = 0; i < GetMenuItemCount(menu);) {
+        bool sep = (GetMenuState(menu, i, MF_BYPOSITION) & MF_SEPARATOR) != 0;
+        if (sep && prevSep) { DeleteMenu(menu, i, MF_BYPOSITION); continue; }
+        prevSep = sep;
+        ++i;
+    }
+    int n = GetMenuItemCount(menu);
+    if (n > 0 && (GetMenuState(menu, n - 1, MF_BYPOSITION) & MF_SEPARATOR)) DeleteMenu(menu, n - 1, MF_BYPOSITION);
+    if (seenChanged) ConfigSave();
+}
+
 int ShowItemContextMenu(HWND owner, POINT pt, const std::wstring& folder, const std::vector<std::wstring>& paths,
                         const std::vector<MenuEntry>& extra,
-                        const std::function<bool(const std::wstring& verb)>& onVerb) {
+                        const std::function<bool(const std::wstring& verb)>& onVerb,
+                        HMENU extraSubmenu, const wchar_t* extraSubmenuLabel) {
     HMENU menu = CreatePopupMenu();
     UINT pos = 0;
     for (auto& e : extra) {
@@ -415,6 +609,7 @@ int ShowItemContextMenu(HWND owner, POINT pt, const std::wstring& folder, const 
         else InsertMenuW(menu, pos++, MF_BYPOSITION | MF_STRING | (e.checked ? MF_CHECKED : 0) | (e.disabled ? MF_GRAYED : 0),
                          kExtraBase + e.id, e.label.c_str());
     }
+    if (extraSubmenu) InsertMenuW(menu, pos++, MF_BYPOSITION | MF_POPUP, (UINT_PTR)extraSubmenu, extraSubmenuLabel);
     IContextMenu* cm = paths.empty() ? nullptr : GetUIObject<IContextMenu>(owner, paths, IID_IContextMenu);
     if (cm) {
         if (pos) InsertMenuW(menu, pos++, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
@@ -423,6 +618,7 @@ int ShowItemContextMenu(HWND owner, POINT pt, const std::wstring& folder, const 
         cm->QueryContextMenu(menu, pos, kShellFirst, kShellLast, flags);
         cm->QueryInterface(IID_PPV_ARGS(&g_cm3));
         if (!g_cm3) cm->QueryInterface(IID_PPV_ARGS(&g_cm2));
+        if (GetKeyState(VK_SHIFT) >= 0) CleanShellMenu(menu, pos);   // Shift+right-click shows everything
     }
     // Remove a leading/trailing separator the shell may leave
     int count = GetMenuItemCount(menu);

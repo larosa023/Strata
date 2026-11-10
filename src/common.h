@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <iterator>
 
-#define STRATA_VERSION L"0.1.1"
+#define STRATA_VERSION L"0.2.0"
 #define STRATA_WNDCLASS L"StrataMain"
 
 // Messages posted to the main window
@@ -29,6 +29,16 @@ constexpr UINT WM_STRATA_DRIVES     = WM_APP + 3;  // lParam: std::vector<DriveI
 constexpr UINT WM_STRATA_DIRCHANGED = WM_APP + 4;  // wParam: watcher generation
 constexpr UINT WM_STRATA_OPDONE     = WM_APP + 5;  // lParam: OpResult*
 constexpr UINT WM_STRATA_SEARCH     = WM_APP + 6;  // lParam: SearchBatch*
+constexpr UINT WM_STRATA_QUEUE      = WM_APP + 7;  // transfer queue progress changed
+constexpr UINT WM_STRATA_QUEUEASK   = WM_APP + 8;  // lParam: QueueAsk* (sent; answer before returning)
+constexpr UINT WM_STRATA_JOBDONE    = WM_APP + 9;  // lParam: JobResult*
+constexpr UINT WM_STRATA_SIZES      = WM_APP + 10; // folder sizes computed
+constexpr UINT WM_STRATA_UPDATE     = WM_APP + 11; // updater status changed
+constexpr UINT WM_STRATA_PREVIEW    = WM_APP + 12; // lParam: PreviewResult*
+constexpr UINT WM_STRATA_THUMB      = WM_APP + 13; // lParam: ThumbResult*
+constexpr UINT WM_STRATA_GIT        = WM_APP + 14; // lParam: GitResult*
+constexpr UINT WM_STRATA_TRAY       = WM_APP + 15; // tray icon callback
+constexpr UINT WM_STRATA_INDEX      = WM_APP + 16; // whole-PC index progress
 
 // ---- log.cpp ----
 void LogInit();

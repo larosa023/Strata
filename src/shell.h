@@ -33,15 +33,26 @@ void ClipboardSetText(HWND owner, const std::wstring& text);
 // Opens a file with its default program. If the item is a shortcut to a folder, returns false and sets *folderTarget.
 bool OpenItem(HWND owner, const std::wstring& path, std::wstring* folderTarget);
 void OpenTerminal(const std::wstring& folder);
+bool CreateShortcutIn(const std::wstring& target, const std::wstring& folder);
 void ShowProperties(HWND owner, const std::vector<std::wstring>& paths);
+// Put items deleted to the Recycle Bin back where they were. Returns how many were restored.
+size_t RestoreFromRecycleBin(HWND owner, const std::vector<std::wstring>& originalPaths);
+// Shell-backed operations for items the copy engine can't handle (e.g. inside zip files)
+void ShellCopyOut(HWND owner, const std::vector<std::wstring>& sources, const std::wstring& destFolder);
+// Copy one item out of an archive into a temp folder (blocking). Returns the extracted path.
+bool ExtractToTemp(HWND owner, const std::wstring& path, std::wstring& out);
+// The labels (without '&') of the Windows menu entries Strata has seen, for Settings > Context menu
+void ContextMenuSeen(std::vector<std::wstring>& out);
 
 // ---- context menu
 // Shows the Windows context menu for the given items with Strata's own entries on top.
 // `extra` lists (id, label) pairs; id 0 is a separator. Returns the chosen extra id (>0),
 // 0 if nothing / a shell command ran, or -1 if the shell verb was intercepted via `onVerb`.
+constexpr UINT kMenuExtraBase = 0x7000;   // ids for a caller-built extra submenu: kMenuExtraBase + id
 struct MenuEntry { int id; std::wstring label; bool checked = false; bool disabled = false; };
 int ShowItemContextMenu(HWND owner, POINT screenPt, const std::wstring& folder, const std::vector<std::wstring>& paths,
                         const std::vector<MenuEntry>& extra,
-                        const std::function<bool(const std::wstring& verb)>& onVerb);
+                        const std::function<bool(const std::wstring& verb)>& onVerb,
+                        HMENU extraSubmenu = nullptr, const wchar_t* extraSubmenuLabel = nullptr);
 // Lets submenus such as "Send to" and "Open with" draw while a shell menu is open.
 bool ShellMenuHandleMessage(UINT msg, WPARAM wp, LPARAM lp, LRESULT* result);

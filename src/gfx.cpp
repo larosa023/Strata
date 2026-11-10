@@ -34,6 +34,24 @@ bool Init() {
     return true;
 }
 
+bool FontAvailable(const wchar_t* name) {
+    if (!dw) return false;
+    IDWriteFontCollection* sys = nullptr;
+    dw->GetSystemFontCollection(&sys, FALSE);
+    bool ok = FontExists(sys, name);
+    SafeRelease(sys);
+    return ok;
+}
+
+const wchar_t* MonoFont() {
+    static std::wstring mono;
+    if (mono.empty()) {
+        for (const wchar_t* f : {L"Cascadia Mono", L"Consolas", L"Courier New"}) if (FontAvailable(f)) { mono = f; break; }
+        if (mono.empty()) mono = s_uiFont;
+    }
+    return mono.c_str();
+}
+
 const wchar_t* IconFont() { return s_iconFont.c_str(); }
 const wchar_t* UiFont() { return s_uiFont.c_str(); }
 const wchar_t* DisplayFont() { return s_displayFont.c_str(); }
@@ -122,8 +140,55 @@ static D2D1_COLOR_F TuneAccent(D2D1_COLOR_F a, bool dark) {
     return a;
 }
 
+bool HighContrastOn() {
+    HIGHCONTRASTW hc{sizeof(hc)};
+    return SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0) && (hc.dwFlags & HCF_HIGHCONTRASTON);
+}
+
+static D2D1_COLOR_F SysColor(int idx) {
+    COLORREF c = GetSysColor(idx);
+    return D2D1::ColorF(GetRValue(c) / 255.f, GetGValue(c) / 255.f, GetBValue(c) / 255.f, 1.0f);
+}
+
+static Theme HighContrastTheme(const Config& c) {
+    Theme t;
+    t.bg = t.bottomBg = t.surface = SysColor(COLOR_WINDOW);
+    t.surfaceStrong = SysColor(COLOR_BTNFACE);
+    t.text = SysColor(COLOR_WINDOWTEXT);
+    t.subtext = SysColor(COLOR_GRAYTEXT);
+    t.accent = SysColor(COLOR_HIGHLIGHT);
+    t.onAccent = SysColor(COLOR_HIGHLIGHTTEXT);
+    t.hover = Alpha(t.accent, 0.25f);
+    t.divider = Alpha(t.text, 0.5f);
+    t.scrim = Alpha(t.bg, 0.8f);
+    t.dark = (t.bg.r + t.bg.g + t.bg.b) < 1.5f;
+    t.radius = c.cornerRadius;
+    t.backdrop = 0;
+    t.opacity = 1.0f;
+    t.glow = false;
+    return t;
+}
+
 Theme BuildThemeNamed(const Config& c, const wchar_t* themeId) {
+    if (c.respectHighContrast && HighContrastOn()) return HighContrastTheme(c);
     std::wstring id = themeId;
+    if (id == L"custom") {
+        // An imported theme: a base preset plus color overrides
+        std::wstring base = L"dark";
+        for (auto& kv : c.customColors) if (kv.first.rfind(L"base:", 0) == 0) base = kv.first.substr(5);
+        Theme t = BuildThemeNamed(c, base.c_str());
+        for (auto& kv : c.customColors) {
+            D2D1_COLOR_F col = Rgb(kv.second);
+            if (kv.first == L"bg") t.bg = col;
+            else if (kv.first == L"chrome" || kv.first == L"bottomBg") t.bottomBg = col;
+            else if (kv.first == L"surface") t.surface = col;
+            else if (kv.first == L"surfaceStrong") t.surfaceStrong = col;
+            else if (kv.first == L"text") t.text = col;
+            else if (kv.first == L"subtext") t.subtext = col;
+            else if (kv.first == L"accent") t.accent = col;
+        }
+        return t;
+    }
     if (id == L"system") id = WindowsUsesLightTheme() ? L"light" : L"dark";
     Theme t;
     uint32_t presetAccent = 0;

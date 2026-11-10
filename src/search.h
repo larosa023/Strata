@@ -17,6 +17,7 @@ struct SearchBatch {
     bool everything = false;           // results came from Everything
     uint64_t total = 0;                // Everything: total matches (may exceed what was returned)
     size_t scannedFolders = 0;         // built-in scan progress
+    bool fromIndex = false;            // results came from Strata's own index
 };
 
 constexpr size_t kSearchMaxResults = 5000;

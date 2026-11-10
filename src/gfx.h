@@ -13,7 +13,9 @@ extern IDWriteFactory* dw;
 bool Init();
 const wchar_t* IconFont();      // "Segoe Fluent Icons" on Windows 11, "Segoe MDL2 Assets" on Windows 10
 const wchar_t* UiFont();        // "Segoe UI Variable Text" when present, else "Segoe UI"
-const wchar_t* DisplayFont();   // "Segoe UI Variable Display" when present, else "Segoe UI"
+const wchar_t* DisplayFont();
+const wchar_t* MonoFont();      // Cascadia Mono, else Consolas
+bool FontAvailable(const wchar_t* name);   // "Segoe UI Variable Display" when present, else "Segoe UI"
 
 IDWriteTextFormat* Format(const wchar_t* family, float size, DWRITE_FONT_WEIGHT weight,
                           DWRITE_TEXT_ALIGNMENT align, bool ellipsis, bool wrap = false);
@@ -81,6 +83,7 @@ extern const int kThemePresetCount;
 
 bool SystemBackdropSupported();      // Windows 11 22H2+
 bool WindowsUsesLightTheme();
+bool HighContrastOn();
 uint32_t WindowsAccentRgb();
 Theme BuildTheme(const Config& c);
 Theme BuildThemeNamed(const Config& c, const wchar_t* themeId);  // for previews
