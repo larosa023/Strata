@@ -3975,6 +3975,35 @@ void TrayOnMessage(HWND owner, LPARAM lp) {
 }
 
 // ============================================================ window procedure
+// Strata's window has no WS_SYSMENU: with it, DWM draws its own min/max/close buttons into the
+// Mica/acrylic frame, where they show through our title bar as faint "ghost" buttons. So the
+// system menu (Alt+Space, right-click the title bar) is shown by hand.
+static void ShowSystemMenu(HWND hwnd, int x, int y) {
+    HMENU m = GetSystemMenu(hwnd, FALSE);
+    HMENU own = nullptr;
+    if (!m || GetMenuItemCount(m) <= 0) {   // some systems give no system menu without WS_SYSMENU: build one
+        own = m = CreatePopupMenu();
+        AppendMenuW(m, MF_STRING, SC_RESTORE, L"&Restore");
+        AppendMenuW(m, MF_STRING, SC_MOVE, L"&Move");
+        AppendMenuW(m, MF_STRING, SC_SIZE, L"&Size");
+        AppendMenuW(m, MF_STRING, SC_MINIMIZE, L"Mi&nimize");
+        AppendMenuW(m, MF_STRING, SC_MAXIMIZE, L"Ma&ximize");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, SC_CLOSE, L"&Close\tAlt+F4");
+    }
+    bool zoomed = IsZoomed(hwnd);
+    EnableMenuItem(m, SC_RESTORE, MF_BYCOMMAND | (zoomed ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(m, SC_MOVE, MF_BYCOMMAND | (zoomed ? MF_GRAYED : MF_ENABLED));
+    EnableMenuItem(m, SC_SIZE, MF_BYCOMMAND | (zoomed ? MF_GRAYED : MF_ENABLED));
+    EnableMenuItem(m, SC_MINIMIZE, MF_BYCOMMAND | MF_ENABLED);
+    EnableMenuItem(m, SC_MAXIMIZE, MF_BYCOMMAND | (zoomed ? MF_GRAYED : MF_ENABLED));
+    EnableMenuItem(m, SC_CLOSE, MF_BYCOMMAND | MF_ENABLED);
+    SetMenuDefaultItem(m, SC_CLOSE, FALSE);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, hwnd, nullptr);
+    if (own) DestroyMenu(own);
+    if (cmd) PostMessageW(hwnd, WM_SYSCOMMAND, (WPARAM)cmd, 0);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     LRESULT menuResult = 0;
     if (ShellMenuHandleMessage(msg, wp, lp, &menuResult)) return menuResult;
@@ -4091,14 +4120,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN: {
+            if (msg == WM_SYSKEYDOWN && wp == VK_F4) { PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }   // no WS_SYSMENU, so do Alt+F4 ourselves
+            if (msg == WM_SYSKEYDOWN && wp == VK_SPACE) {   // Alt+Space system menu (also no WS_SYSMENU)
+                RECT wr;
+                GetWindowRect(hwnd, &wr);
+                ShowSystemMenu(hwnd, wr.left + (int)(8 * g_scale), wr.top + (int)(kTitleH * g_scale));
+                return 0;
+            }
             bool handledSys = msg == WM_SYSKEYDOWN && (wp == VK_LEFT || wp == VK_RIGHT || wp == VK_UP || wp == 'D' || wp == VK_RETURN);
             if (msg == WM_SYSKEYDOWN && !handledSys && wp != VK_F10) break;
             OnKeyDown((UINT)wp);
             return 0;
         }
         case WM_SYSCHAR:
-            if (wp == L' ') break;   // Alt+Space system menu
-            return 0;
+            return 0;   // (Alt+Space is handled in WM_SYSKEYDOWN)
+        case WM_NCRBUTTONUP:
+            if (wp == HTCAPTION) { ShowSystemMenu(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0; }
+            break;
         case WM_CHAR: {
             wchar_t ch = (wchar_t)wp;
             if (g_focus == Focus::List) {
@@ -4309,7 +4347,7 @@ HWND MainCreate(HINSTANCE inst, const std::vector<std::wstring>& openPaths, bool
         x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - w) / 2;
         y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - h) / 2;
     }
-    g_hwnd = CreateWindowExW(0, STRATA_WNDCLASS, L"Strata", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y, w, h, nullptr, nullptr, inst, nullptr);
+    g_hwnd = CreateWindowExW(0, STRATA_WNDCLASS, L"Strata", (WS_OVERLAPPEDWINDOW & ~WS_SYSMENU) | WS_CLIPCHILDREN, x, y, w, h, nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) { Log(L"CreateWindow failed %lu", GetLastError()); return nullptr; }
     g_dpi = GetDpiForWindow(g_hwnd);
     g_scale = g_dpi / 96.0f;

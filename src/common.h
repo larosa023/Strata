@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <iterator>
 
-#define STRATA_VERSION L"0.2.0"
+#define STRATA_VERSION L"0.2.1"
 #define STRATA_WNDCLASS L"StrataMain"
 
 // Messages posted to the main window
