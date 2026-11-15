@@ -53,6 +53,7 @@ Command line: `Strata.exe "D:\Projects"` opens a folder in a new tab · `--tray`
 | **Files** | F2 rename (with several selected: **batch rename** with live preview) · Del → Recycle Bin · Shift+Del delete · Ctrl+C/X/V · **Ctrl+Z undo** · Ctrl+Shift+N new folder · Ctrl+Shift+C copy path · Alt+Enter properties · drag and drop anywhere |
 | **Transfers** | Ctrl+J opens the queue (pause, resume, skip, cancel, speed and ETA). Long transfers end with a soft chime and an "Open folder" card |
 | **Tags** | Right-click → Tag. Click a tag in the sidebar to see everything with it |
+| **Command bar** | New ▾ · Cut · Copy · Paste · Rename · Delete · Sort ▾ · View ▾ · Filter ▾ · Changed ▾ · Undo · Select all · Properties, under the toolbar like File Explorer (hide it from View ▾) |
 | **Sidebar** | Drag pins, drives, tags, saved searches or whole section headers to rearrange them. Click a header to collapse it |
 | **Settings** | Ctrl+, opens General, Layout (including animations and version stacking), Themes, Search, Tags, File operations (including sounds and notifications), Updates and About |
 

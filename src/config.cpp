@@ -102,7 +102,7 @@ struct FloatField { const wchar_t* key; float Config::*m; float lo, hi; };
 static const BoolField kBools[] = {
     {L"useWindowsAccent", &Config::useWindowsAccent}, {L"accentGlow", &Config::accentGlow},
     {L"respectHighContrast", &Config::respectHighContrast}, {L"showSidebar", &Config::showSidebar},
-    {L"showPreview", &Config::showPreview}, {L"showStatusBar", &Config::showStatusBar}, {L"showNavButtons", &Config::showNavButtons},
+    {L"showPreview", &Config::showPreview}, {L"showStatusBar", &Config::showStatusBar}, {L"showCommandBar", &Config::showCommandBar}, {L"showNavButtons", &Config::showNavButtons},
     {L"showViewSwitch", &Config::showViewSwitch}, {L"sidebarRecent", &Config::sidebarRecent}, {L"sidebarTags", &Config::sidebarTags},
     {L"sidebarSaved", &Config::sidebarSaved}, {L"showHidden", &Config::showHidden}, {L"showExtensions", &Config::showExtensions},
     {L"foldersFirst", &Config::foldersFirst}, {L"rememberFolderViews", &Config::rememberFolderViews}, {L"folderSizes", &Config::folderSizes},

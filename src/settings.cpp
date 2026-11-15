@@ -202,6 +202,8 @@ static void BuildLayout(std::vector<Ctl>& v) {
                        [] { return g_config.stackVersions; }, [](bool b) { g_config.stackVersions = b; Changed(); }));
     v.push_back(Toggle(L"Preview panel", L"Ctrl+P. Space opens a big quick look you can flip through with the arrow keys.", [] { return g_config.showPreview; },
                        [](bool b) { g_config.showPreview = b; Changed(); }));
+    v.push_back(Toggle(L"Command bar", L"New, Cut, Copy, Paste, Rename, Delete, Sort and View under the toolbar, like File Explorer.",
+                       [] { return g_config.showCommandBar; }, [](bool b) { g_config.showCommandBar = b; Changed(); }));
     v.push_back(Toggle(L"Status bar", nullptr, [] { return g_config.showStatusBar; }, [](bool b) { g_config.showStatusBar = b; Changed(); }));
     v.push_back(Toggle(L"Back / forward / up buttons", nullptr, [] { return g_config.showNavButtons; }, [](bool b) { g_config.showNavButtons = b; Changed(); }));
     v.push_back(Toggle(L"View switch", L"The dual / single / grid buttons in the toolbar.", [] { return g_config.showViewSwitch; },

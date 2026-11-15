@@ -58,6 +58,7 @@ struct Config {
     bool showSidebar = true;
     bool showPreview = false;
     bool showStatusBar = true;
+    bool showCommandBar = true;           // New / Cut / Copy / Paste / Rename / Delete / Sort / View bar under the toolbar
     bool showNavButtons = true;            // back / forward / up / refresh
     bool showViewSwitch = true;
     bool sidebarRecent = true;

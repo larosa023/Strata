@@ -124,7 +124,7 @@ enum ZoneKind {
     ZCrumbOverflow, ZSearch, ZSearchClear, ZMenu, ZSideThisPC, ZSidePin, ZSideDrive, ZSideSplitter, ZHeader, ZHeaderDiv,
     ZList, ZScrollbar, ZPaneSplitter, ZPreviewSplitter, ZViewSwitch, ZUpdatePill, ZQueueStatus, ZQueueJobPause, ZQueueJobCancel,
     ZQueueClear, ZQueueClose, ZPreviewButton, ZSideTag, ZSideSaved, ZSideRecent, ZSideSection, ZPreviewToggle,
-    ZStack, ZFocusChip, ZFocusClear, ZJumpItem, ZQlPrev, ZQlNext, ZQlClose, ZQlOpen, ZOverlay, ZToast, ZToastAction, ZToastClose
+    ZCmd, ZStack, ZFocusChip, ZFocusClear, ZJumpItem, ZQlPrev, ZQlNext, ZQlClose, ZQlOpen, ZOverlay, ZToast, ZToastAction, ZToastClose
 };
 }  // namespace
 namespace {  // file-local type (keeps it from clashing with same-named types in other files)
@@ -200,7 +200,9 @@ constexpr UINT_PTR TIMER_SCROLL = 1, TIMER_CARET = 2, TIMER_REFRESH = 3, TIMER_S
                    TIMER_PREVIEW = 11, TIMER_QUEUECLOSE = 13;
 
 // metrics (DIPs)
-constexpr float kTitleH = 40, kToolH = 48, kStatusH = 28, kHeaderH = 32, kCapW = 46, kSplitW = 6, kResize = 6;
+constexpr float kTitleH = 40, kToolH = 48, kStatusH = 28, kHeaderH = 32, kCapW = 46, kSplitW = 6, kResize = 6, kCmdH = 42;
+static float CmdBarH() { return g_config.showCommandBar ? kCmdH : 0.0f; }
+static float ChromeTop() { return kTitleH + kToolH + CmdBarH(); }   // where the sidebar and panes start
 static float RowH() {
     float base = g_config.density == L"compact" ? 26.0f : 32.0f;
     return base + std::max(0.0f, (g_config.fontSize - 13.0f) * 2.0f);
@@ -1743,8 +1745,227 @@ static void SideMove(ZoneKind k, int from, int to) {
     Redraw();
 }
 
+// ============================================================ command bar (New, Cut, Copy, Paste, Rename, Delete, Sort, View …)
+enum CmdId { CmdNew, CmdCut, CmdCopy, CmdPaste, CmdRename, CmdDelete, CmdSort, CmdView, CmdFilter, CmdChanged, CmdUndo, CmdSelectAll, CmdProps, CmdCount };
+static std::wstring g_cmdTip;
+static D2D1_RECT_F g_cmdTipAt{};
+
+
+static void PaintCommandBar() {
+    float top = kTitleH + kToolH, bottom = top + kCmdH;
+    g_cv.Fill(R(0, top, g_W, bottom), MainColor());
+    g_cv.Fill(R(0, bottom - 0.5f, g_W, bottom + 0.5f), g_theme.divider);
+    g_cmdTip.clear();
+    Pane& t = T();
+    bool folder = !t.path.empty() && !DriveView(t) && t.archive.empty();
+    bool writable = folder && !t.searchActive && t.tagFilter.empty();
+    size_t nsel = SelectedCount(t);
+    bool anySel = nsel > 0 && !DriveView(t);
+    struct B { CmdId id; wchar_t glyph; const wchar_t* label; bool enabled; bool menu; bool accent; };
+    std::vector<B> left = {
+        {CmdNew, 0xE710, L"New", writable, true, true},
+        {CmdCut, 0xE8C6, L"Cut", anySel && t.archive.empty(), false, false},
+        {CmdCopy, 0xE8C8, L"Copy", anySel, false, false},
+        {CmdPaste, 0xE77F, L"Paste", writable && ClipboardHasFiles(), false, false},
+        {CmdRename, 0xE8AC, L"Rename", anySel && t.archive.empty(), false, false},
+        {CmdDelete, 0xE74D, L"Delete", anySel && t.archive.empty(), false, false},
+        {CmdSort, 0xE8CB, L"Sort", !t.view.empty() && t.viewMode != ViewSpace, true, false},
+        {CmdView, 0xE8A9, L"View", true, true, false},
+        {CmdFilter, 0xE71C, L"Filter", !DriveView(t), true, false},
+        {CmdChanged, 0xE81C, L"Changed", true, true, false},
+    };
+    std::vector<B> right = {
+        {CmdUndo, 0xE7A7, L"Undo", !g_undo.empty(), false, false},
+        {CmdSelectAll, 0xE8B3, L"Select all", !t.view.empty() && !DriveView(t), false, false},
+        {CmdProps, 0xE946, L"Properties", folder || anySel, false, false},
+    };
+    // separators after these
+    auto sepAfter = [](CmdId id) { return id == CmdNew || id == CmdDelete || id == CmdView; };
+    auto width = [&](const B& b, bool labels) {
+        float w = labels ? 12 + 16 + 7 + MeasureWidth(b.label, g_fUi) + 12 : 36;
+        if (b.menu) w += labels ? 14 : 10;
+        return w;
+    };
+    float avail = g_W - 20;
+    float need = 0;
+    for (auto& b : left) need += width(b, true) + 2 + (sepAfter(b.id) ? 13 : 0);
+    for (auto& b : right) need += width(b, true) + 2;
+    bool labels = need + 40 < avail;
+    // with less room, the right-hand group keeps icons only first
+    bool rightLabels = labels;
+    if (!labels) {
+        float n2 = 0;
+        for (auto& b : left) n2 += width(b, true) + 2 + (sepAfter(b.id) ? 13 : 0);
+        for (auto& b : right) n2 += width(b, false) + 2;
+        labels = n2 + 40 < avail;
+    }
+    float cy = (top + bottom) / 2, bh = 32;
+    auto draw = [&](const B& b, float x, bool lab) {
+        float w = width(b, lab);
+        D2D1_RECT_F r = R(x, cy - bh / 2, x + w, cy + bh / 2);
+        AddZone(ZCmd, b.id, r);
+        bool hot = b.enabled && Hot(ZCmd, b.id);
+        D2D1_COLOR_F ink = b.enabled ? g_theme.text : Alpha(g_theme.subtext, 0.45f);
+        if (hot) g_cv.FillRound(r, 6, g_theme.hover);
+        if (b.accent && b.enabled && !hot) g_cv.FillRound(r, 6, Alpha(g_theme.accent, 0.14f));
+        float gx = lab ? r.left + 10 : (b.menu ? r.left + 4 : r.left + 8);
+        D2D1_COLOR_F gc = b.accent && b.enabled ? g_theme.accent : b.id == CmdDelete && b.enabled ? Mix(ink, Rgb(0xE5484D), 0.35f) : ink;
+        g_cv.Glyph(b.glyph, g_fIcon, R(gx, r.top, gx + 20, r.bottom), gc);
+        if (lab) g_cv.Text(b.label, g_fUi, R(gx + 24, r.top, r.right - (b.menu ? 18 : 6), r.bottom), ink);
+        if (b.menu) g_cv.Glyph(0xE70D, g_fIconSmall, R(r.right - (lab ? 20 : 14), r.top + 1, r.right - (lab ? 6 : 2), r.bottom), Alpha(ink, 0.8f));
+        if (!lab && hot) { g_cmdTip = b.label; g_cmdTipAt = r; }
+        return w;
+    };
+    float x = 10;
+    for (auto& b : left) {
+        x += draw(b, x, labels) + 2;
+        if (sepAfter(b.id)) { g_cv.Fill(R(x + 5, cy - 10, x + 6, cy + 10), g_theme.divider); x += 13; }
+    }
+    float rw = 0;
+    for (auto& b : right) rw += width(b, rightLabels) + 2;
+    float rx = std::max(x + 8, g_W - 10 - rw);
+    for (auto& b : right) rx += draw(b, rx, rightLabels) + 2;
+    // selection summary in the gap ("3 selected")
+    if (nsel > 0 && rx - rw - x > 120 && labels) {
+        float gapL = x + 8, gapR = g_W - 10 - rw - 8;
+        if (gapR - gapL > 90)
+            g_cv.Text(WithCommas(nsel) + (nsel == 1 ? L" selected" : L" selected"), g_fSmallRight, R(gapL, top, gapR, bottom), Alpha(g_theme.subtext, 0.8f));
+    }
+}
+
+static void PaintCommandTip() {
+    if (g_cmdTip.empty()) return;
+    float w = MeasureWidth(g_cmdTip, g_fSmall) + 16;
+    float cx = (g_cmdTipAt.left + g_cmdTipAt.right) / 2;
+    D2D1_RECT_F r = R(std::max(4.0f, cx - w / 2), g_cmdTipAt.bottom + 6, 0, g_cmdTipAt.bottom + 28);
+    r.right = r.left + w;
+    D2D1_COLOR_F bg = g_theme.surfaceStrong;
+    bg.a = 1;
+    g_cv.FillRound(r, 5, bg);
+    g_cv.StrokeRound(r, 5, g_theme.divider, 1);
+    g_cv.Text(g_cmdTip, g_fSmall, R(r.left + 8, r.top, r.right - 4, r.bottom), g_theme.text);
+}
+
+static POINT CmdMenuPoint(CmdId id) {
+    for (auto& z : g_zones)
+        if (z.kind == ZCmd && z.idx == id) {
+            POINT pt{(LONG)(z.rc.left * g_scale), (LONG)((z.rc.bottom + 2) * g_scale)};
+            ClientToScreen(g_hwnd, &pt);
+            return pt;
+        }
+    POINT pt{0, 0};
+    GetCursorPos(&pt);
+    return pt;
+}
+
+static void ToggleGrid();
+static void ToggleSpace();
+static void ChangedMenu(POINT pt);
+static void FocusFilterMenu(POINT pt);
+static void BeginRename();
+
+static void SetSort(Pane& t, int col, bool desc) {
+    t.sortColumn = col;
+    t.sortDescending = desc;
+    g_config.sortColumn = col;
+    g_config.sortDescending = desc;
+    ConfigSave();
+    SaveFolderView(t);
+    BuildView(t);
+    Redraw();
+}
+
+static void CommandClicked(int id) {
+    Pane& t = T();
+    switch (id) {
+        case CmdNew: {
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, 1, L"Folder\tCtrl+Shift+N");
+            AppendMenuW(m, MF_STRING, 2, L"Text document");
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING, 3, L"New tab\tCtrl+T");
+            POINT pt = CmdMenuPoint(CmdNew);
+            UINT c = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+            DestroyMenu(m);
+            if (c == 1) NewFolder();
+            else if (c == 2) NewTextFile();
+            else if (c == 3) AddTab(t.path, true, g_active + 1, nullptr, 0);
+            break;
+        }
+        case CmdCut: DoCopyCut(true); break;
+        case CmdCopy: DoCopyCut(false); break;
+        case CmdPaste: DoPaste(t.path); break;
+        case CmdRename: SetFocusTo(Focus::List); BeginRename(); break;
+        case CmdDelete: DoDelete(GetKeyState(VK_SHIFT) < 0); break;
+        case CmdSort: {
+            HMENU m = CreatePopupMenu();
+            const wchar_t* names[] = {L"Name", L"Size", L"Date modified", L"Type"};
+            for (int c = 0; c < ColCount; ++c) AppendMenuW(m, MF_STRING | (t.sortColumn == c ? MF_CHECKED : 0), 1 + c, names[c]);
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING | (!t.sortDescending ? MF_CHECKED : 0), 10, L"Ascending");
+            AppendMenuW(m, MF_STRING | (t.sortDescending ? MF_CHECKED : 0), 11, L"Descending");
+            POINT pt = CmdMenuPoint(CmdSort);
+            UINT c = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+            DestroyMenu(m);
+            if (c >= 1 && c <= (UINT)ColCount) SetSort(t, (int)c - 1, t.sortColumn == (int)c - 1 ? t.sortDescending : (c - 1 == ColModified || c - 1 == ColSize));
+            else if (c == 10 || c == 11) SetSort(t, t.sortColumn, c == 11);
+            break;
+        }
+        case CmdView: {
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING | (t.viewMode == ViewList ? MF_CHECKED : 0), 1, L"Details");
+            AppendMenuW(m, MF_STRING | (t.viewMode == ViewGrid ? MF_CHECKED : 0), 2, L"Large icons (grid)\tCtrl+Shift+G");
+            AppendMenuW(m, MF_STRING | (t.viewMode == ViewSpace ? MF_CHECKED : 0), 3, L"What's using space\tCtrl+Shift+S");
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING | (DualMode() ? MF_CHECKED : 0), 4, L"Dual pane\tCtrl+\\");
+            AppendMenuW(m, MF_STRING | (g_config.showPreview ? MF_CHECKED : 0), 5, L"Preview panel\tCtrl+P");
+            AppendMenuW(m, MF_STRING | (g_config.showSidebar ? MF_CHECKED : 0), 6, L"Sidebar\tCtrl+B");
+            AppendMenuW(m, MF_STRING | (g_config.showStatusBar ? MF_CHECKED : 0), 7, L"Status bar");
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING | (g_config.showHidden ? MF_CHECKED : 0), 8, L"Hidden items\tCtrl+H");
+            AppendMenuW(m, MF_STRING | (g_config.showExtensions ? MF_CHECKED : 0), 9, L"File name extensions");
+            AppendMenuW(m, MF_STRING | (g_config.stackVersions ? MF_CHECKED : 0), 10, L"Stack file versions");
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING | (g_config.showCommandBar ? MF_CHECKED : 0), 11, L"Command bar");
+            POINT pt = CmdMenuPoint(CmdView);
+            UINT c = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+            DestroyMenu(m);
+            auto rebuildAll = [] { for (auto& tb_ : g_tabs) for (auto& pn : tb_.pane) BuildView(pn); };
+            switch (c) {
+                case 1:
+                    if (t.viewMode == ViewSpace) ToggleSpace();
+                    else if (t.viewMode == ViewGrid) ToggleGrid();
+                    break;
+                case 2: if (t.viewMode == ViewSpace) ToggleSpace(); if (t.viewMode != ViewGrid) ToggleGrid(); break;
+                case 3: if (t.viewMode != ViewSpace) ToggleSpace(); break;
+                case 4: ToggleDual(); break;
+                case 5: TogglePreview(); break;
+                case 6: g_config.showSidebar = !g_config.showSidebar; ConfigSave(); break;
+                case 7: g_config.showStatusBar = !g_config.showStatusBar; ConfigSave(); break;
+                case 8: g_config.showHidden = !g_config.showHidden; ConfigSave(); rebuildAll(); break;
+                case 9: g_config.showExtensions = !g_config.showExtensions; ConfigSave(); break;
+                case 10: g_config.stackVersions = !g_config.stackVersions; ConfigSave(); rebuildAll(); break;
+                case 11: g_config.showCommandBar = !g_config.showCommandBar; ConfigSave();
+                         SetStatus(g_config.showCommandBar ? L"" : L"Command bar hidden — bring it back from ⋯ → View, or Settings → Layout"); break;
+            }
+            break;
+        }
+        case CmdFilter: FocusFilterMenu(CmdMenuPoint(CmdFilter)); break;
+        case CmdChanged: ChangedMenu(CmdMenuPoint(CmdChanged)); break;
+        case CmdUndo: Undo(); break;
+        case CmdSelectAll: for (int v : t.view) t.sel[v] = 1; break;
+        case CmdProps: {
+            auto paths = SelectedPaths(t);
+            if (paths.empty() && !t.path.empty()) paths.push_back(t.path);
+            if (!paths.empty()) ShowProperties(g_hwnd, paths);
+            break;
+        }
+    }
+    Redraw();
+}
+
 static void PaintSidebar() {
-    float top = kTitleH + kToolH, bottom = g_H - (g_config.showStatusBar ? kStatusH : 0);
+    float top = ChromeTop(), bottom = g_H - (g_config.showStatusBar ? kStatusH : 0);
     float vis = SidebarW(), w = g_config.sidebarWidth;   // (vis < w while it slides in or out)
     g_rcSidebar = R(0, top, vis, bottom);
     g_cv.Fill(g_rcSidebar, SidebarColor());
@@ -2446,7 +2667,7 @@ static float PreviewW() {
 }
 
 static void PaintPanes() {
-    float left = SidebarW(), top = kTitleH + kToolH, bottom = g_H - StatusH();
+    float left = SidebarW(), top = ChromeTop(), bottom = g_H - StatusH();
     float right = g_W - PreviewW();
     Tab& tb = TB();
     if (!DualMode()) {
@@ -2635,12 +2856,14 @@ static void Paint() {
     g_rt->Clear(g_theme.backdrop ? D2D1::ColorF(0, 0, 0, 0) : g_theme.bottomBg);
     if (!g_tabs.empty()) {
         PaintToolbar();
+        if (g_config.showCommandBar) PaintCommandBar();
         if (SidebarW() > 0) PaintSidebar();
         else g_rcSidebar = R(0, 0, 0, 0);
         PaintPanes();
         if (g_config.showStatusBar) PaintStatus();
         PaintQueuePanel();
         PaintTitleBar();   // last, so the dragged tab floats over everything
+        PaintCommandTip();
         PaintToasts();
         PaintOverlays();
     }
@@ -2866,6 +3089,7 @@ static void AppMenu(POINT pt) {
     AppendMenuW(m, MF_STRING | (T().viewMode == ViewGrid ? MF_CHECKED : 0), 31, L"Grid view\tCtrl+Shift+G");
     AppendMenuW(m, MF_STRING | (T().viewMode == ViewSpace ? MF_CHECKED : 0), 34, L"Space view\tCtrl+Shift+S");
     AppendMenuW(m, MF_STRING | (g_config.stackVersions ? MF_CHECKED : 0), 35, L"Stack file versions");
+    AppendMenuW(m, MF_STRING | (g_config.showCommandBar ? MF_CHECKED : 0), 36, L"Command bar");
     AppendMenuW(m, MF_STRING | (g_config.showPreview ? MF_CHECKED : 0), 32, L"Preview panel\tCtrl+P");
     AppendMenuW(m, MF_STRING | (g_config.showSidebar ? MF_CHECKED : 0), 33, L"Sidebar\tCtrl+B");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -2900,6 +3124,7 @@ static void AppMenu(POINT pt) {
         case 30: ToggleDual(); break;
         case 31: ToggleGrid(); break;
         case 34: ToggleSpace(); break;
+        case 36: g_config.showCommandBar = !g_config.showCommandBar; ConfigSave(); break;
         case 35: g_config.stackVersions = !g_config.stackVersions; ConfigSave(); for (auto& tb_ : g_tabs) for (auto& pn : tb_.pane) BuildView(pn); break;
         case 40: JumpOpen(); break;
         case 41: ChangedMenu(MenuPointBelowSearch()); break;
@@ -3688,7 +3913,7 @@ static void OnLButtonDown(float x, float y, bool dbl) {
         case ZMenu: case ZSearchClear: case ZCrumb: case ZCrumbArrow: case ZCrumbOverflow: case ZSideThisPC: case ZSidePin: case ZSideDrive:
         case ZViewSwitch: case ZUpdatePill: case ZQueueStatus: case ZQueueJobPause: case ZQueueJobCancel: case ZQueueClear: case ZQueueClose:
         case ZPreviewButton: case ZSideTag: case ZSideSaved: case ZSideRecent: case ZSideSection: case ZPreviewToggle:
-        case ZStack: case ZFocusChip: case ZFocusClear: case ZJumpItem: case ZQlPrev: case ZQlNext: case ZQlClose: case ZQlOpen:
+        case ZCmd: case ZStack: case ZFocusChip: case ZFocusClear: case ZJumpItem: case ZQlPrev: case ZQlNext: case ZQlClose: case ZQlOpen:
         case ZOverlay: case ZToast: case ZToastAction: case ZToastClose:
             g_drag = SideReorderable(z.kind) ? Drag::SidePress : Drag::None;
             g_sideDrag = SideDrag{};
@@ -3821,7 +4046,7 @@ static void OnMouseMove(float x, float y) {
                     float headerY = -1;
                     for (auto& zz : g_zones) if (zz.kind == ZSideSection && posOf(zz.idx) == to) headerY = zz.rc.top - 3;
                     if (headerY >= 0) lineY = headerY;
-                    else lineY = g_sideContentH + kTitleH + kToolH - g_sideScroll;
+                    else lineY = g_sideContentH + ChromeTop() - g_sideScroll;
                 }
                 if (to >= (int)order.size()) to = (int)order.size();
             }
@@ -3995,6 +4220,7 @@ static void OnLButtonUp(float x, float y) {
             WatchActive();
             break;
         case ZPreviewToggle: TogglePreview(); break;
+        case ZCmd: CommandClicked(z.idx); break;
         case ZStack: if (z.pane >= 0) { Pane& sp = PaneAt(z.pane); StackSet(sp, z.idx, !(sp.stackKeys.count(z.idx) && sp.openStacks.count(sp.stackKeys[z.idx]))); } break;
         case ZFocusChip: if (z.pane >= 0) FocusFilterMenu(pt); break;
         case ZFocusClear: if (z.pane >= 0) SetFocusFilter(PaneAt(z.pane), L"", L""); break;
@@ -4087,11 +4313,11 @@ static void OnWheel(float x, float y, int delta) {
         Redraw();
         return;
     }
-    if (PreviewW() > 0 && x >= g_W - PreviewW() && y >= kTitleH + kToolH) {
+    if (PreviewW() > 0 && x >= g_W - PreviewW() && y >= ChromeTop()) {
         PreviewScroll(delta);
         return;
     }
-    if (y >= kTitleH + kToolH) {
+    if (y >= ChromeTop()) {
         // scroll the pane under the mouse (it doesn't have to be the active one)
         Pane* target = &t;
         for (auto& pn : TB().pane) if (In(pn.rcPane, x, y)) target = &pn;
