@@ -5414,7 +5414,7 @@ static void OnUpdateStatus() {
         else if (st.state == updater::State::Error) { SetStatus(L"Update check failed: " + st.message); g_manualUpdateCheck = false; }
         else if (st.state == updater::State::Available) g_manualUpdateCheck = false;
     }
-    if (st.state == updater::State::Ready && g_installWhenReady) { g_installWhenReady = false; AutoUpdateInstallNow(); }
+    if (st.state == updater::State::Ready && g_installWhenReady) { g_installWhenReady = false; AutoUpdateInstallNow(true); }
     SettingsOnUpdateStatus();
     Redraw();
 }
@@ -5440,7 +5440,11 @@ static std::wstring PlainNotes(const std::wstring& md) {
 
 static void UpdatePillClicked() {
     updater::Status st = updater::Get();
-    if (st.state == updater::State::Ready) { AutoUpdateInstallNow(); return; }
+    if (st.state == updater::State::Ready) {
+        if (QueueBusy()) { SetStatus(L"The update installs as soon as your file transfers finish"); }
+        AutoUpdateInstallNow(true);
+        return;
+    }
     if (st.state != updater::State::Available) return;
     // changelog + one-click update
     std::wstring notes = PlainNotes(st.release.notes);

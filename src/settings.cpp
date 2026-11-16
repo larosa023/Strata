@@ -1047,7 +1047,7 @@ static void Click(int ci, int part, float x) {
         case CType::UpdateCard:
             if (part == 0) AutoUpdateCheckNow();
             else if (part == 1) AutoUpdateDownloadNow();
-            else if (part == 2) AutoUpdateInstallNow();
+            else if (part == 2) AutoUpdateInstallNow(true);
             else if (part == 3) ShellOpen(updater::Get().release.page.c_str());
             break;
         default: break;

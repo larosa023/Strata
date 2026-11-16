@@ -476,8 +476,12 @@ bool UserIsBusy() {
         if (q == QUNS_BUSY || q == QUNS_RUNNING_D3D_FULL_SCREEN || q == QUNS_PRESENTATION_MODE) return true;
     }
     // Borderless fullscreen games and videos: the foreground window covers its whole monitor.
+    // (Not this app's own windows, and not ordinary maximized windows: a maximized window with a
+    // custom title bar also covers the monitor, and must not block its own update.)
     HWND fg = GetForegroundWindow();
-    if (fg && fg != GetDesktopWindow() && fg != GetShellWindow()) {
+    DWORD fgPid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &fgPid);
+    if (fg && fgPid != GetCurrentProcessId() && !IsZoomed(fg) && fg != GetDesktopWindow() && fg != GetShellWindow()) {
         wchar_t cls[64] = {};
         GetClassNameW(fg, cls, 64);
         if (wcscmp(cls, L"WorkerW") != 0 && wcscmp(cls, L"Progman") != 0) {

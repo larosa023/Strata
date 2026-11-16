@@ -1,10 +1,7 @@
-## Strata 0.3.2
+## Strata 0.3.3
 
-- **Cleaner menus:** the ⋯ menu, the command bar's New / Sort / View / Filter / Changed menus, tab and sidebar menus, and the folder-background right-click menu are now drawn in Strata's theme.
-  - Rounded cards with an acrylic blur on Windows 11.
-  - A soft hover with an accent marker.
-  - Accent check marks, icons, quiet shortcut hints, and section captions.
-  - Submenus open on hover.
-  - Full keyboard control: arrows, Enter, Esc and letter keys.
-- **Tidier ⋯ menu:** view toggles moved into **View ▸**, and theme, background and row height into **Appearance ▸**.
-- The right-click menu on files is still the Windows one, so shell extensions like 7-Zip keep working there.
+- **Fixed: updates wouldn't install while Strata was maximized.** The updater waits for full-screen games and videos to close before installing. A maximized Strata window also fills the screen, so Strata mistook itself for a game and kept postponing. Now:
+  - Strata's own windows and normal maximized windows don't count as full-screen.
+  - Clicking **Update** installs straight away. The only thing it still waits for is a file transfer in progress, and it tells you when that's the case.
+
+Also in 0.3.2: menus drawn in Strata's theme (rounded, acrylic, icons, accent checks), and a tidier ⋯ menu with View and Appearance submenus.

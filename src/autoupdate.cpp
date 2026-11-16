@@ -9,6 +9,7 @@ void (*g_releaseAppForUpdate)() = nullptr;
 static HWND g_owner = nullptr;
 static DWORD g_updatedFromPid = 0;
 static bool g_installPending = false;
+static bool g_installPendingUser = false;   // the pending install was asked for by a click
 static std::wstring g_failedVersion;
 
 static double UnixNow() { return (double)time(nullptr); }
@@ -54,7 +55,7 @@ void AutoUpdateOnStarted() {
 
 void AutoUpdateOnTimer() {
     SetTimer(g_owner, TIMER_UPDATE_CHECK, 30 * 60 * 1000, nullptr);
-    if (g_installPending) { AutoUpdateInstallNow(); return; }
+    if (g_installPending) { AutoUpdateInstallNow(g_installPendingUser); return; }
     if (!g_config.autoCheck) return;
     if (UnixNow() >= g_config.lastCheck + g_config.checkHours * 3600.0) updater::CheckAsync(false);
 }
@@ -68,16 +69,22 @@ bool AutoUpdateAvailable() {
            st == updater::State::Ready;
 }
 
-void AutoUpdateInstallNow() {
+void AutoUpdateInstallNow(bool userAsked) {
     if (updater::Get().state != updater::State::Ready) return;
-    // Never interrupt a file transfer, a game or a presentation
-    if (QueueBusy() || updater::UserIsBusy()) {
+    // Never interrupt a file transfer; automatic installs also wait out games and presentations
+    // (when you click Update yourself, you're clearly not in a game)
+    bool transfer = QueueBusy();
+    bool busy = !userAsked && updater::UserIsBusy();
+    if (transfer || busy) {
         g_installPending = true;
-        SetTimer(g_owner, TIMER_UPDATE_CHECK, 60 * 1000, nullptr);
-        Log(L"Update install deferred (transfer running or user busy)");
+        g_installPendingUser = g_installPendingUser || userAsked;
+        // retry soon: a click waits only for the transfer, so check every 10 seconds
+        SetTimer(g_owner, TIMER_UPDATE_CHECK, (userAsked ? 10 : 60) * 1000, nullptr);
+        Log(L"Update install deferred (%ls)", transfer ? L"file transfer running" : L"full-screen app in front");
         return;
     }
     g_installPending = false;
+    g_installPendingUser = false;
     std::wstring error;
     bool ok = updater::InstallAndRestart([] { if (g_releaseAppForUpdate) g_releaseAppForUpdate(); }, &error);
     if (!ok) {

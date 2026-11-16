@@ -10,7 +10,7 @@ void AutoUpdateOnStatus();           // WM_STRATA_UPDATE
 void AutoUpdateApplySettings();
 void AutoUpdateCheckNow();
 void AutoUpdateDownloadNow();
-void AutoUpdateInstallNow();
+void AutoUpdateInstallNow(bool userAsked = false);   // userAsked: they clicked Update, so don't wait for "busy"
 bool AutoUpdateAvailable();
 std::wstring AutoUpdateFailedVersion();   // set when the last update failed to start and was rolled back
 extern void (*g_releaseAppForUpdate)();   // set by the window: saves the session, releases the single-instance mutex
