@@ -18,6 +18,7 @@
 #include "query.h"
 #include "batch.h"
 #include "dialogs.h"
+#include "menu.h"
 #include "visits.h"
 #include "versions.h"
 #include "treemap.h"
@@ -1884,8 +1885,11 @@ static void CommandClicked(int id) {
             AppendMenuW(m, MF_STRING, 2, L"Text document");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(m, MF_STRING, 3, L"New tab\tCtrl+T");
+            MenuIcon(m, 1, 0xE8F4);
+            MenuIcon(m, 2, 0xE8A5);
+            MenuIcon(m, 3, 0xE710);
             POINT pt = CmdMenuPoint(CmdNew);
-            UINT c = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+            UINT c = ThemedMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd);
             DestroyMenu(m);
             if (c == 1) NewFolder();
             else if (c == 2) NewTextFile();
@@ -1905,7 +1909,7 @@ static void CommandClicked(int id) {
             AppendMenuW(m, MF_STRING | (!t.sortDescending ? MF_CHECKED : 0), 10, L"Ascending");
             AppendMenuW(m, MF_STRING | (t.sortDescending ? MF_CHECKED : 0), 11, L"Descending");
             POINT pt = CmdMenuPoint(CmdSort);
-            UINT c = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+            UINT c = ThemedMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd);
             DestroyMenu(m);
             if (c >= 1 && c <= (UINT)ColCount) SetSort(t, (int)c - 1, t.sortColumn == (int)c - 1 ? t.sortDescending : (c - 1 == ColModified || c - 1 == ColSize));
             else if (c == 10 || c == 11) SetSort(t, t.sortColumn, c == 11);
@@ -1928,7 +1932,7 @@ static void CommandClicked(int id) {
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(m, MF_STRING | (g_config.showCommandBar ? MF_CHECKED : 0), 11, L"Command bar");
             POINT pt = CmdMenuPoint(CmdView);
-            UINT c = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+            UINT c = ThemedMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd);
             DestroyMenu(m);
             auto rebuildAll = [] { for (auto& tb_ : g_tabs) for (auto& pn : tb_.pane) BuildView(pn); };
             switch (c) {
@@ -2893,7 +2897,7 @@ static void PinColorMenu(int pinIdx, POINT pt) {
     HMENU m = CreatePopupMenu();
     for (int i = 0; i < (int)std::size(colors); ++i)
         AppendMenuW(m, MF_STRING | (g_config.pins[pinIdx].color == colors[i].rgb ? MF_CHECKED : 0), 100 + i, colors[i].name);
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    UINT cmd = ThemedMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd);
     DestroyMenu(m);
     if (cmd >= 100 && cmd < 100 + std::size(colors)) {
         g_config.pins[pinIdx].color = colors[cmd - 100].rgb;
@@ -2914,7 +2918,7 @@ static void SidebarMenu(ZoneKind k, int idx, POINT pt) {
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(m, MF_STRING, 4, L"Reset sidebar order");
         AppendMenuW(m, MF_GRAYED, 0, L"Tip: drag headers and items to rearrange");
-        UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+        UINT cmd = ThemedMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd);
         DestroyMenu(m);
         if (cmd == 1) ToggleSidebarSection(idx);
         if (cmd == 2) SideMove(ZSideSection, pos, pos - 1);
@@ -2944,7 +2948,7 @@ static void SidebarMenu(ZoneKind k, int idx, POINT pt) {
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         addMoves(m);
         AppendMenuW(m, MF_STRING, 3, k == ZSideTag ? L"Edit tags in Settings…" : L"Remove saved search");
-        UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+        UINT cmd = ThemedMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd);
         DestroyMenu(m);
         doMoves(cmd);
         if (cmd == 1) { if (k == ZSideTag) ShowTag(T(), g_config.tags[idx].id); else RunSavedSearch(idx, false); }
@@ -2985,7 +2989,7 @@ static void SidebarMenu(ZoneKind k, int idx, POINT pt) {
         AppendMenuW(m, MF_STRING, 20, L"Properties");
     }
     AppendMenuW(m, MF_STRING | (DualMode() ? 0 : MF_GRAYED), 5, L"Open in other pane");
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    UINT cmd = ThemedMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd);
     DestroyMenu(m);
     switch (cmd) {
         case 1: Navigate(T(), path); break;
@@ -3025,7 +3029,7 @@ static void TabMenu(int idx, POINT pt) {
     for (int c = 0; c < (int)std::size(kTabColors); ++c)
         AppendMenuW(colors, MF_STRING | (g_tabs[idx].color == kTabColors[c].rgb ? MF_CHECKED : 0), 20 + c, kTabColors[c].name);
     AppendMenuW(m, MF_POPUP, (UINT_PTR)colors, L"Tab color");
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    UINT cmd = ThemedMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd);
     DestroyMenu(m);
     if (cmd >= 20 && cmd < 20 + std::size(kTabColors)) { g_tabs[idx].color = kTabColors[cmd - 20].rgb; Redraw(); return; }
     switch (cmd) {
@@ -3065,16 +3069,37 @@ static void TabMenu(int idx, POINT pt) {
 
 static void AppMenu(POINT pt) {
     HMENU m = CreatePopupMenu();
-    HMENU theme = CreatePopupMenu(), back = CreatePopupMenu(), density = CreatePopupMenu();
+    HMENU view = CreatePopupMenu(), look = CreatePopupMenu();
+    // View ▸
+    AppendMenuW(view, MF_STRING | (DualMode() ? MF_CHECKED : 0), 30, L"Dual pane\tCtrl+\\");
+    AppendMenuW(view, MF_STRING | (T().viewMode == ViewGrid ? MF_CHECKED : 0), 31, L"Grid view\tCtrl+Shift+G");
+    AppendMenuW(view, MF_STRING | (T().viewMode == ViewSpace ? MF_CHECKED : 0), 34, L"Space view\tCtrl+Shift+S");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(view, MF_STRING | (g_config.showPreview ? MF_CHECKED : 0), 32, L"Preview panel\tCtrl+P");
+    AppendMenuW(view, MF_STRING | (g_config.showSidebar ? MF_CHECKED : 0), 33, L"Sidebar\tCtrl+B");
+    AppendMenuW(view, MF_STRING | (g_config.showCommandBar ? MF_CHECKED : 0), 36, L"Command bar");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(view, MF_STRING | (g_config.showHidden ? MF_CHECKED : 0), 10, L"Hidden items\tCtrl+H");
+    AppendMenuW(view, MF_STRING | (g_config.showExtensions ? MF_CHECKED : 0), 11, L"File extensions");
+    AppendMenuW(view, MF_STRING | (g_config.foldersFirst ? MF_CHECKED : 0), 12, L"Folders first");
+    AppendMenuW(view, MF_STRING | (g_config.stackVersions ? MF_CHECKED : 0), 35, L"Stack file versions");
+    // Appearance ▸ (theme, background, row height)
+    AppendMenuW(look, MF_STRING | MF_GRAYED, 0, L"Theme");
     for (int i = 0; i < kThemePresetCount; ++i)
-        AppendMenuW(theme, MF_STRING | (g_config.theme == kThemePresets[i].id ? MF_CHECKED : 0), 100 + i, kThemePresets[i].name);
+        AppendMenuW(look, MF_STRING | (g_config.theme == kThemePresets[i].id ? MF_CHECKED : 0), 100 + i, kThemePresets[i].name);
     const wchar_t* backs[] = {L"solid", L"mica", L"acrylic"};
     const wchar_t* backNames[] = {L"Solid", L"Mica", L"Acrylic (blur)"};
+    AppendMenuW(look, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(look, MF_STRING | MF_GRAYED, 0, L"Background");
     for (int i = 0; i < 3; ++i)
-        AppendMenuW(back, MF_STRING | (g_config.backdrop == backs[i] ? MF_CHECKED : 0) | (i && !SystemBackdropSupported() ? MF_GRAYED : 0),
+        AppendMenuW(look, MF_STRING | (g_config.backdrop == backs[i] ? MF_CHECKED : 0) | (i && !SystemBackdropSupported() ? MF_GRAYED : 0),
                     200 + i, backNames[i]);
-    AppendMenuW(density, MF_STRING | (g_config.density == L"compact" ? MF_CHECKED : 0), 300, L"Compact");
-    AppendMenuW(density, MF_STRING | (g_config.density == L"comfortable" ? MF_CHECKED : 0), 301, L"Comfortable");
+    AppendMenuW(look, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(look, MF_STRING | MF_GRAYED, 0, L"Row height");
+    AppendMenuW(look, MF_STRING | (g_config.density == L"compact" ? MF_CHECKED : 0), 300, L"Compact");
+    AppendMenuW(look, MF_STRING | (g_config.density == L"comfortable" ? MF_CHECKED : 0), 301, L"Comfortable");
+    AppendMenuW(look, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(look, MF_STRING, 23, L"More in Settings…");
 
     AppendMenuW(m, MF_STRING, 1, L"New tab\tCtrl+T");
     AppendMenuW(m, MF_STRING | (g_closedTabs.empty() ? MF_GRAYED : 0), 2, L"Reopen closed tab\tCtrl+Shift+T");
@@ -3085,26 +3110,31 @@ static void AppMenu(POINT pt) {
     AppendMenuW(m, MF_STRING, 41, L"What changed…\tCtrl+Shift+H");
     AppendMenuW(m, MF_STRING | (T().focusFilter.empty() ? 0 : MF_CHECKED), 42, L"Focus filter…\tCtrl+Shift+F");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (DualMode() ? MF_CHECKED : 0), 30, L"Dual pane\tCtrl+\\");
-    AppendMenuW(m, MF_STRING | (T().viewMode == ViewGrid ? MF_CHECKED : 0), 31, L"Grid view\tCtrl+Shift+G");
-    AppendMenuW(m, MF_STRING | (T().viewMode == ViewSpace ? MF_CHECKED : 0), 34, L"Space view\tCtrl+Shift+S");
-    AppendMenuW(m, MF_STRING | (g_config.stackVersions ? MF_CHECKED : 0), 35, L"Stack file versions");
-    AppendMenuW(m, MF_STRING | (g_config.showCommandBar ? MF_CHECKED : 0), 36, L"Command bar");
-    AppendMenuW(m, MF_STRING | (g_config.showPreview ? MF_CHECKED : 0), 32, L"Preview panel\tCtrl+P");
-    AppendMenuW(m, MF_STRING | (g_config.showSidebar ? MF_CHECKED : 0), 33, L"Sidebar\tCtrl+B");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)view, L"View");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)look, L"Appearance");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (g_config.showHidden ? MF_CHECKED : 0), 10, L"Show hidden items\tCtrl+H");
-    AppendMenuW(m, MF_STRING | (g_config.showExtensions ? MF_CHECKED : 0), 11, L"Show file extensions");
-    AppendMenuW(m, MF_STRING | (g_config.foldersFirst ? MF_CHECKED : 0), 12, L"Folders first");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)theme, L"Theme");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)back, L"Background");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)density, L"Row height");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, 23, L"Settings…\tCtrl+,");
+    AppendMenuW(m, MF_STRING, 23, L"Settings\tCtrl+,");
     AppendMenuW(m, MF_STRING, 24, L"Check for updates");
     AppendMenuW(m, MF_STRING, 22, L"About Strata");
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_RIGHTALIGN, pt.x, pt.y, g_hwnd, nullptr);
+    MenuIcon(m, 1, 0xE710);    // add
+    MenuIcon(m, 2, 0xE777);    // restore
+    MenuIcon(m, 3, 0xE7A7);    // undo
+    MenuIcon(m, 4, 0xE896);    // download
+    MenuIcon(m, 40, 0xE838);   // folder open
+    MenuIcon(m, 41, 0xE81C);   // history
+    MenuIcon(m, 42, 0xE71C);   // filter
+    MenuIcon(m, 23, 0xE713);   // settings
+    MenuIcon(m, 24, 0xE895);   // sync
+    MenuIcon(m, 22, 0xE946);   // info
+    {
+        MENUITEMINFOW mi{sizeof(mi)};
+        mi.fMask = MIIM_DATA;
+        mi.dwItemData = 0xE8A9;   // view (submenus are set by position)
+        SetMenuItemInfoW(m, 9, TRUE, &mi);
+        mi.dwItemData = 0xE790;   // color
+        SetMenuItemInfoW(m, 10, TRUE, &mi);
+    }
+    UINT cmd = ThemedMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_RIGHTALIGN, pt.x, pt.y, g_hwnd);
     DestroyMenu(m);
     if (cmd >= 100 && cmd < 100 + (UINT)kThemePresetCount) { g_config.theme = kThemePresets[cmd - 100].id; ConfigSave(); ApplyTheme(); return; }
     if (cmd >= 200 && cmd < 203) { g_config.backdrop = backs[cmd - 200]; ConfigSave(); ApplyTheme(); return; }
@@ -3143,7 +3173,7 @@ static void HeaderMenu(POINT pt) {
         AppendMenuW(m, MF_STRING | (g_config.columnVisible[c] ? MF_CHECKED : 0), 1 + c, kColLabel[c]);
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, 50, L"Reset column widths");
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    UINT cmd = ThemedMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd);
     DestroyMenu(m);
     if (cmd >= 2 && cmd < 1 + ColCount) g_config.columnVisible[cmd - 1] = !g_config.columnVisible[cmd - 1];
     if (cmd == 50) { Config d; for (int c = 0; c < ColCount; ++c) g_config.columnWidth[c] = d.columnWidth[c]; }
@@ -3168,7 +3198,7 @@ static void CrumbMenu(int crumbIdx, POINT pt) {
         AppendMenuW(m, MF_STRING | (!next.empty() && _wcsicmp(next.c_str(), paths[i].c_str()) == 0 ? MF_CHECKED : 0) |
                            ((i > 0 && i % 30 == 0) ? MF_MENUBARBREAK : 0), 1 + i, label.c_str());
     }
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    UINT cmd = ThemedMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd);
     DestroyMenu(m);
     if (cmd >= 1 && cmd <= paths.size()) {
         if (GetKeyState(VK_CONTROL) < 0) OpenFolderInNewTab(paths[cmd - 1], true);
@@ -3183,7 +3213,7 @@ static void OverflowMenu(POINT pt) {
         std::wstring label = p == L"\x01" ? L"This PC" : (p.size() == 3 && g_driveNames.count(p) ? g_driveNames[p] : PathLeaf(p));
         AppendMenuW(m, MF_STRING, 1 + i, label.c_str());
     }
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    UINT cmd = ThemedMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd);
     DestroyMenu(m);
     if (cmd >= 1 && cmd <= g_hiddenCrumbs.size()) {
         std::wstring p = g_hiddenCrumbs[cmd - 1];
@@ -3313,7 +3343,24 @@ static void ListContextMenu(POINT screenPt, bool onItem) {
     AppendMenuW(m, MF_STRING | (t.focusFilter.empty() ? 0 : MF_CHECKED), IC_FocusMenu, L"Focus filter…\tCtrl+Shift+F");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (real ? 0 : MF_GRAYED), IC_Props, L"Properties");
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, g_hwnd, nullptr);
+    {
+        MENUITEMINFOW mi{sizeof(mi)};
+        mi.fMask = MIIM_DATA;
+        mi.dwItemData = 0xE710;
+        SetMenuItemInfoW(m, 0, TRUE, &mi);   // New ▸
+    }
+    MenuIcon(newMenu, IC_NewFolder, 0xE8F4);
+    MenuIcon(newMenu, IC_NewText, 0xE8A5);
+    MenuIcon(m, IC_Paste, 0xE77F);
+    MenuIcon(m, IC_Refresh, 0xE72C);
+    MenuIcon(m, IC_SelectAll, 0xE8B3);
+    MenuIcon(m, IC_Terminal, 0xE756);
+    MenuIcon(m, IC_CopyPath, 0xE8C8);
+    MenuIcon(m, IC_Pin, 0xE718);
+    MenuIcon(m, IC_Changed, 0xE81C);
+    MenuIcon(m, IC_FocusMenu, 0xE71C);
+    MenuIcon(m, IC_Props, 0xE946);
+    UINT cmd = ThemedMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, g_hwnd);
     DestroyMenu(m);
     switch (cmd) {
         case IC_NewFolder: NewFolder(); break;
@@ -3507,7 +3554,7 @@ static void FocusFilterMenu(POINT pt) {
     AppendMenuW(m, MF_STRING, 101, L"Custom filter…");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (t.focusFilter.empty() ? MF_GRAYED : 0), 102, L"Show everything\tEsc");
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    UINT cmd = ThemedMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd);
     DestroyMenu(m);
     if (cmd >= 1 && cmd <= (UINT)n) SetFocusFilter(t, presets[cmd - 1].query, presets[cmd - 1].label);
     else if (cmd == 100) SetFocusFilter(t, L"type:" + ext, L"Only ." + ext);
@@ -3553,7 +3600,7 @@ static void ChangedMenu(POINT pt) {
     AppendMenuW(m, MF_STRING, 3, L"Last 7 days");
     AppendMenuW(m, MF_STRING, 4, L"Last 30 days");
     AppendMenuW(m, MF_STRING, 5, L"Since a date…");
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    UINT cmd = ThemedMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x, pt.y, g_hwnd);
     DestroyMenu(m);
     SYSTEMTIME lt;
     GetLocalTime(&lt);

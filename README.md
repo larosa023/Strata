@@ -115,6 +115,7 @@ src/
   shell.cpp/.h      icons, Windows context menu (+ cleanup), IFileOperation, clipboard, launching
   queue.cpp/.h      transfer queue: CopyFileEx engine, pause/skip/cancel, verify, speed/ETA
   batch.cpp/.h      batch rename with live preview
+  menu.cpp/.h       themed popup menus (Strata's own menus; the Windows file menu stays native)
   dialogs.cpp/.h    themed dialogs (conflicts, confirmations, prompts) + theming for classic dialogs
   visits.cpp/.h     folder visit history: Jump to folder and "since my last visit"
   versions.cpp/.h   version stacking (rev1 / rev2 / Rev B / dated copies)
