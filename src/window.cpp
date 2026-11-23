@@ -293,6 +293,11 @@ static int g_toastNext = 1;
 static std::wstring g_trayToastFolder;
 static size_t g_overlayZoneStart = (size_t)-1;   // zones from here on belong to an open overlay
 constexpr UINT_PTR TIMER_TOAST = 15;
+// Slow double-click (click an already-selected item's name, wait) renames it, like File Explorer
+constexpr UINT_PTR TIMER_CLICKRENAME = 16;
+static int g_clickRenameRow = -1;
+static bool g_pressCanRename = false;
+static DWORD g_activatedAt = 0;
 constexpr DWORD kToastLife = 7000;
 
 // forward declarations (features defined further down)
@@ -3788,6 +3793,8 @@ static bool OnInputKey(UINT vk) {
 }
 
 static void OnKeyDown(UINT vk) {
+    KillTimer(g_hwnd, TIMER_CLICKRENAME);
+    g_clickRenameRow = -1;
     bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0, alt = GetKeyState(VK_MENU) < 0;
     if (g_focus != Focus::List) {
         if (OnInputKey(vk)) return;
@@ -3927,6 +3934,9 @@ static void ApplyMarquee() {
 static bool g_pressWasSelected = false;
 
 static void OnLButtonDown(float x, float y, bool dbl) {
+    KillTimer(g_hwnd, TIMER_CLICKRENAME);
+    g_clickRenameRow = -1;
+    g_pressCanRename = false;
     SetCapture(g_hwnd);
     g_drag = Drag::None;
     g_dragMoved = false;
@@ -4031,6 +4041,22 @@ static void OnLButtonDown(float x, float y, bool dbl) {
                 } else {
                     // plain click: select now (or on button-up for an already-selected row, so a drag keeps the selection)
                     g_pressWasSelected = t.sel[idx] != 0;
+                    // clicking the name of the one selected item (not the click that brought Strata forward) can rename it
+                    if (g_pressWasSelected && SelectedCount(t) == 1 && t.focus == v && !dbl && !DriveView(t) && t.archive.empty() &&
+                        GetTickCount() - g_activatedAt > 500) {
+                        bool onName = true;
+                        if (t.viewMode == ViewList) {
+                            onName = false;
+                            for (auto& c : t.cols)
+                                if (c.col == ColName) {
+                                    float textW = MeasureWidth(DisplayName(t.items[idx]), g_fUi);
+                                    onName = x >= c.left + 30 && x <= std::min(c.right, c.left + 34 + textW + 10);
+                                }
+                        } else if (t.viewMode == ViewSpace) {
+                            onName = false;
+                        }
+                        g_pressCanRename = onName;
+                    }
                     if (!g_pressWasSelected) SelectOnly(t, v);
                     t.focus = v;
                     g_pressRow = v;
@@ -4196,6 +4222,12 @@ static void OnLButtonUp(float x, float y) {
         return;
     }
     if (was == Drag::ListPress) {
+        if (!g_dragMoved && g_pressCanRename && g_pressRow >= 0) {
+            // wait out the double-click time: a second click opens instead
+            g_clickRenameRow = g_pressRow;
+            SetTimer(g_hwnd, TIMER_CLICKRENAME, GetDoubleClickTime() + 80, nullptr);
+        }
+        g_pressCanRename = false;
         if (!g_dragMoved && g_pressWasSelected && g_pressRow >= 0 && g_pressRow < (int)t.view.size()) SelectOnly(t, g_pressRow);
         g_pressRow = -1;
         Redraw();
@@ -5657,6 +5689,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Redraw();
             return DefWindowProcW(hwnd, msg, wp, -1);
         case WM_ACTIVATE:
+            if (LOWORD(wp) != WA_INACTIVE) g_activatedAt = GetTickCount();
+            else { KillTimer(hwnd, TIMER_CLICKRENAME); g_clickRenameRow = -1; }
             Redraw();
             break;
         case WM_GETMINMAXINFO: {
@@ -5765,6 +5799,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == TIMER_UPDATE_CHECK) { AutoUpdateOnTimer(); return 0; }
             if (wp == TIMER_TOAST) { ExpireToasts(); return 0; }
+            if (wp == TIMER_CLICKRENAME) {
+                KillTimer(hwnd, TIMER_CLICKRENAME);
+                Pane& t = T();
+                if (g_clickRenameRow >= 0 && g_clickRenameRow == t.focus && SelectedCount(t) == 1 && g_focus == Focus::List &&
+                    g_drag == Drag::None && !g_ql.open && !g_jump.open && GetForegroundWindow() == hwnd)
+                    BeginRename();
+                g_clickRenameRow = -1;
+                return 0;
+            }
             if (wp == TIMER_ANIM) {
                 if ((int)(GetTickCount() - g_animUntil) >= 0) KillTimer(hwnd, TIMER_ANIM);
                 Redraw();

@@ -1,7 +1,7 @@
-## Strata 0.3.3
+## Strata 0.3.4
 
-- **Fixed: updates wouldn't install while Strata was maximized.** The updater waits for full-screen games and videos to close before installing. A maximized Strata window also fills the screen, so Strata mistook itself for a game and kept postponing. Now:
-  - Strata's own windows and normal maximized windows don't count as full-screen.
-  - Clicking **Update** installs straight away. The only thing it still waits for is a file transfer in progress, and it tells you when that's the case.
-
-Also in 0.3.2: menus drawn in Strata's theme (rounded, acrylic, icons, accent checks), and a tidier ⋯ menu with View and Appearance submenus.
+- **Slow double-click to rename**, like File Explorer. Click the name of a file or folder that's already selected, pause, and the name becomes editable.
+  - A normal double-click still opens it.
+  - Dragging, pressing a key, or clicking somewhere else cancels the rename.
+  - The click that brings Strata to the front doesn't count, so switching windows never starts a rename by accident.
+  - In the list view it starts only when you click the name itself, not the empty space beside it.
