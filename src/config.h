@@ -126,6 +126,8 @@ struct Config {
 extern Config g_config;
 void ConfigLoad();
 void ConfigSave();
+// Set in a window made by dragging a tab out: its saves keep the main window's session and placement.
+extern bool g_configSecondaryWindow;
 std::wstring ConfigPath();
 void ConfigDefaultTags();
 

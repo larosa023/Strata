@@ -42,6 +42,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     std::vector<std::wstring> paths;
     bool quit = false, tray = false, uninstall = false, restoreExplorer = false, waitOld = false;
+    NewWindowArgs nw;
+    auto after = [](const std::wstring& a, const wchar_t* key) { size_t n = wcslen(key); return a.compare(0, n, key) == 0 ? a.substr(n) : std::wstring(); };
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; argv && i < argc; ++i) {
@@ -52,6 +54,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         else if (a == L"--restore-explorer") restoreExplorer = true;
         else if (a == L"--wait-old") waitOld = true;
         else if (a == L"--updated" || a == L"--rolled-back") ++i;   // value handled by the updater
+        else if (a == L"--new-window") nw.active = true;
+        else if (a.rfind(L"--left=", 0) == 0) nw.left = after(a, L"--left=");
+        else if (a.rfind(L"--right=", 0) == 0) nw.right = after(a, L"--right=");
+        else if (a.rfind(L"--pane=", 0) == 0) nw.pane = _wtoi(after(a, L"--pane=").c_str()) & 1;
+        else if (a.rfind(L"--color=", 0) == 0) nw.color = (uint32_t)wcstoul(after(a, L"--color=").c_str(), nullptr, 10);
+        else if (a == L"--locked") nw.locked = true;
+        else if (a.rfind(L"--rect=", 0) == 0) {
+            int x = 0, y = 0, w = 0, h = 0;
+            if (swscanf_s(after(a, L"--rect=").c_str(), L"%d,%d,%d,%d", &x, &y, &w, &h) == 4) nw.rect = RECT{x, y, x + w, y + h};
+        }
         else if (!a.empty() && a.rfind(L"--", 0) != 0) {
             wchar_t full[4096];
             if (GetFullPathNameW(a.c_str(), (DWORD)std::size(full), full, nullptr)) a = full;
@@ -67,6 +79,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         ConfigLoad();
         SetDefaultFileManager(false, nullptr);
         MessageBoxW(nullptr, L"Folders will open in File Explorer again.", L"Strata", MB_ICONINFORMATION);
+        return 0;
+    }
+
+    if (nw.active) {
+        // a tab dragged out of a Strata window: its own window (and process), no hand-off
+        OleInitialize(nullptr);
+        LogInit();
+        ConfigLoad();
+        g_configSecondaryWindow = true;
+        MainSetNewWindow(nw);
+        HWND hw = MainCreate(inst, {}, false, GetCommandLineW());
+        if (!hw) return 1;
+        MSG m;
+        while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
+        OleUninitialize();
         return 0;
     }
 

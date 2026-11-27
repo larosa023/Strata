@@ -348,8 +348,19 @@ void ConfigLoad() {
         g_config.theme.c_str(), g_config.layout.c_str());
 }
 
+bool g_configSecondaryWindow = false;
+
 void ConfigSave() {
-    if (!WriteUtf8FileAtomic(ConfigPath(), ToText(ToJson()))) Log(L"Failed to save config.json (error %lu)", GetLastError());
+    json::Value root = ToJson();
+    if (g_configSecondaryWindow) {
+        // keep what the main window saved about its own tabs and placement
+        std::wstring text;
+        json::Value disk;
+        if (ReadUtf8File(ConfigPath(), text) && json::Parser(text).Parse(disk) && disk.type == json::Value::Object)
+            for (const wchar_t* k : {L"session", L"sessionActive", L"windowRect", L"maximized"})
+                if (const json::Value* v = disk.Get(k)) root.Set(k, *v);
+    }
+    if (!WriteUtf8FileAtomic(ConfigPath(), ToText(root))) Log(L"Failed to save config.json (error %lu)", GetLastError());
 }
 
 // ---------------------------------------------------------------- per-folder views

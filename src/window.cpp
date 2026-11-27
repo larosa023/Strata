@@ -927,6 +927,176 @@ static void ReopenClosedTab() {
 
 static std::wstring PaneTitle(const Pane& t);
 
+// ============================================================ tearing tabs off into their own window
+// Drag a tab off the tab bar and let go: it opens in a new Strata window there. Drop it on another
+// Strata window and it moves into that window instead. (Each window is its own Strata process; only
+// the first one keeps the saved session, the tray icon and the updater.)
+static bool g_secondary = false;              // this window was made by dragging a tab out
+static NewWindowArgs g_newWin;
+void MainSetNewWindow(const NewWindowArgs& a) { g_newWin = a; g_secondary = true; }
+
+static bool g_tabTearing = false;
+static HWND g_tabGhost = nullptr;
+static std::wstring g_ghostTitle, g_ghostHint;
+constexpr ULONG_PTR kCopyDataTabMove = 0x5355;   // 'SU': left \x1f right \x1f pane \x1f color \x1f locked
+
+static COLORREF RefOf(D2D1_COLOR_F c) { return RGB((int)(c.r * 255), (int)(c.g * 255), (int)(c.b * 255)); }
+
+static LRESULT CALLBACK GhostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        D2D1_COLOR_F bg = Mix(g_theme.bg, g_theme.surfaceStrong, 0.6f);
+        HBRUSH b = CreateSolidBrush(RefOf(bg));
+        FillRect(dc, &rc, b);
+        DeleteObject(b);
+        RECT bar{0, 0, (LONG)(4 * g_scale), rc.bottom};
+        HBRUSH ab = CreateSolidBrush(RefOf(g_theme.accent));
+        FillRect(dc, &bar, ab);
+        DeleteObject(ab);
+        std::wstring fam = g_config.fontFamily.empty() ? UiFont() : g_config.fontFamily;
+        HFONT big = CreateFontW(-(int)(14 * g_scale), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, fam.c_str());
+        HFONT small = CreateFontW(-(int)(12 * g_scale), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, fam.c_str());
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RefOf(g_theme.text));
+        HGDIOBJ old = SelectObject(dc, big);
+        RECT tr{(LONG)(16 * g_scale), (LONG)(8 * g_scale), rc.right - (LONG)(12 * g_scale), (LONG)(30 * g_scale)};
+        DrawTextW(dc, g_ghostTitle.c_str(), -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(dc, small);
+        SetTextColor(dc, RefOf(g_theme.subtext));
+        RECT hr{tr.left, (LONG)(30 * g_scale), tr.right, rc.bottom - (LONG)(6 * g_scale)};
+        DrawTextW(dc, g_ghostHint.c_str(), -1, &hr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(dc, old);
+        DeleteObject(big);
+        DeleteObject(small);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static HWND OtherStrataWindowAt(POINT pt) {
+    HWND w = WindowFromPoint(pt);
+    if (w) w = GetAncestor(w, GA_ROOT);
+    if (!w || w == g_hwnd || w == g_tabGhost) return nullptr;
+    wchar_t cls[64] = {};
+    GetClassNameW(w, cls, 64);
+    return wcscmp(cls, STRATA_WNDCLASS) == 0 ? w : nullptr;
+}
+
+static void TabGhostUpdate(POINT pt) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = GhostProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"StrataTabGhost";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    int w = (int)(280 * g_scale), h = (int)(52 * g_scale);
+    std::wstring hint = OtherStrataWindowAt(pt) ? L"Release to move it to this window" : L"Release to open in a new window";
+    if (!g_tabGhost) {
+        g_tabGhost = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, L"StrataTabGhost", L"",
+                                     WS_POPUP, 0, 0, w, h, g_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        SetLayeredWindowAttributes(g_tabGhost, 0, 235, LWA_ALPHA);
+        int corner = 2;
+        DwmSetWindowAttribute(g_tabGhost, 33 /*DWMWA_WINDOW_CORNER_PREFERENCE*/, &corner, sizeof(corner));
+    }
+    if (hint != g_ghostHint) { g_ghostHint = hint; InvalidateRect(g_tabGhost, nullptr, FALSE); }
+    SetWindowPos(g_tabGhost, HWND_TOPMOST, pt.x - (int)(40 * g_scale), pt.y - (int)(18 * g_scale), w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+static void TabGhostHide() {
+    if (g_tabGhost) { DestroyWindow(g_tabGhost); g_tabGhost = nullptr; }
+    g_ghostHint.clear();
+}
+
+static std::wstring QuoteArg(const std::wstring& a) {
+    // CommandLineToArgvW rules: backslashes before a quote are doubled
+    std::wstring out = L"\"";
+    size_t bs = 0;
+    for (wchar_t c : a) {
+        if (c == L'\\') { ++bs; continue; }
+        if (c == L'"') { out.append(bs * 2 + 1, L'\\'); bs = 0; out += c; continue; }
+        out.append(bs, L'\\');
+        bs = 0;
+        out += c;
+    }
+    out.append(bs * 2, L'\\');
+    return out + L"\"";
+}
+
+static void ActivateTab(int i);
+
+// Takes tab i out of this window: into the Strata window under the cursor, or a brand-new one.
+static void TearOffTab(int i) {
+    if (i < 0 || i >= (int)g_tabs.size()) return;
+    bool last = g_tabs.size() < 2;
+    Tab& tab = g_tabs[i];
+    std::wstring left = tab.pane[0].path, right = tab.pane[1].path;
+    POINT pt;
+    GetCursorPos(&pt);
+    bool moved = false;
+    if (HWND other = OtherStrataWindowAt(pt)) {
+        std::wstring payload = left + L"\x1f" + right + L"\x1f" + std::to_wstring(tab.active) + L"\x1f" + std::to_wstring(tab.color) + L"\x1f" +
+                               (tab.locked ? L"1" : L"0");
+        COPYDATASTRUCT cds{kCopyDataTabMove, (DWORD)((payload.size() + 1) * sizeof(wchar_t)), (PVOID)payload.c_str()};
+        DWORD pid = 0;
+        GetWindowThreadProcessId(other, &pid);
+        AllowSetForegroundWindow(pid);
+        DWORD_PTR r = 0;
+        moved = SendMessageTimeoutW(other, WM_COPYDATA, (WPARAM)g_hwnd, (LPARAM)&cds, SMTO_ABORTIFHUNG, 3000, &r) && r;
+    }
+    if (last) {
+        // this window's only tab went into another window: nothing left here
+        if (moved) PostMessageW(g_hwnd, WM_CLOSE, 1, 0);
+        return;
+    }
+    if (!moved) {
+        // a new window the size of this one (its normal size if this one is maximized), under the cursor
+        WINDOWPLACEMENT wp{sizeof(wp)};
+        GetWindowPlacement(g_hwnd, &wp);
+        RECT cur;
+        GetWindowRect(g_hwnd, &cur);
+        bool big = IsZoomed(g_hwnd);
+        int w = big ? wp.rcNormalPosition.right - wp.rcNormalPosition.left : cur.right - cur.left;
+        int h = big ? wp.rcNormalPosition.bottom - wp.rcNormalPosition.top : cur.bottom - cur.top;
+        MONITORINFO mi{sizeof(mi)};
+        GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi);
+        RECT wa = mi.rcWork;
+        w = std::min(w, (int)(wa.right - wa.left));
+        h = std::min(h, (int)(wa.bottom - wa.top));
+        if (w < (int)(720 * g_scale) || h < (int)(440 * g_scale)) { w = (wa.right - wa.left) * 7 / 10; h = (wa.bottom - wa.top) * 7 / 10; }
+        int x = pt.x - (int)(140 * g_scale), y = pt.y - (int)(20 * g_scale);
+        x = std::clamp(x, (int)wa.left, std::max((int)wa.left, (int)wa.right - w));
+        y = std::clamp(y, (int)wa.top, std::max((int)wa.top, (int)wa.bottom - h));
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring cmd = QuoteArg(exe) + L" --new-window --rect=" + std::to_wstring(x) + L"," + std::to_wstring(y) + L"," + std::to_wstring(w) + L"," +
+                           std::to_wstring(h) + L" " + QuoteArg(L"--left=" + left) + L" " + QuoteArg(L"--right=" + right) + L" --pane=" +
+                           std::to_wstring(tab.active) + L" --color=" + std::to_wstring(tab.color) + (tab.locked ? L" --locked" : L"");
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            Log(L"Couldn't open a new window: %lu", GetLastError());
+            SetStatus(L"Couldn't open a new window");
+            return;
+        }
+        AllowSetForegroundWindow(pi.dwProcessId);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    // gone from here (not to "reopen closed tab")
+    g_tabs.erase(g_tabs.begin() + i);
+    if (g_active > i || g_active >= (int)g_tabs.size()) g_active = std::max(0, g_active - 1);
+    ActivateTab(g_active);
+}
+
 static std::wstring PaneTitle(const Pane& t) {
     if (!t.changedLabel.empty() && t.searchActive) return L"Changed " + t.changedLabel;
     if (!t.tagFilter.empty()) {
@@ -1426,7 +1596,7 @@ static void PaintTitleBar() {
         }
         if (appear < 1) PopFade();
     }
-    if (g_drag == Drag::Tab && g_dragMoved && g_dragIdx >= 0 && g_dragIdx < (int)g_tabs.size()) {
+    if (g_drag == Drag::Tab && g_dragMoved && !g_tabTearing && g_dragIdx >= 0 && g_dragIdx < (int)g_tabs.size()) {
         POINT pt;
         GetCursorPos(&pt);
         ScreenToClient(g_hwnd, &pt);
@@ -3793,6 +3963,7 @@ static bool OnInputKey(UINT vk) {
 }
 
 static void OnKeyDown(UINT vk) {
+    if (g_tabTearing && vk == VK_ESCAPE) { g_tabTearing = false; TabGhostHide(); g_drag = Drag::None; ReleaseCapture(); Redraw(); return; }
     KillTimer(g_hwnd, TIMER_CLICKRENAME);
     g_clickRenameRow = -1;
     bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0, alt = GetKeyState(VK_MENU) < 0;
@@ -4132,6 +4303,21 @@ static void OnMouseMove(float x, float y) {
         }
         case Drag::Tab: {
             if (!g_dragMoved) return;
+            // pulled well off the tab bar (and not the only tab): it's becoming its own window
+            bool off = y < -24 || y > kTitleH + 44 || x < -24 || x > g_W + 24;
+            POINT sp;
+            GetCursorPos(&sp);
+            // a lone tab can't make a new window, but a torn-off window's last tab can go back into another Strata window
+            if (g_tabs.size() < 2) off = off && g_secondary && OtherStrataWindowAt(sp) != nullptr;
+            if (off) {
+                if (!g_tabTearing && g_dragIdx >= 0 && g_dragIdx < (int)g_tabs.size())
+                    g_ghostTitle = PaneTitle(g_tabs[g_dragIdx].pane[g_tabs[g_dragIdx].active]);
+                g_tabTearing = true;
+                TabGhostUpdate(sp);
+                Redraw();
+                return;
+            }
+            if (g_tabTearing) { g_tabTearing = false; TabGhostHide(); }
             float left, tabW;
             TabGeometry(left, tabW);
             int target = std::clamp((int)std::floor((x - left) / tabW), 0, (int)g_tabs.size() - 1);
@@ -4212,7 +4398,14 @@ static void OnLButtonUp(float x, float y) {
     if (GetCapture() == g_hwnd) ReleaseCapture();
     Pane& t = T();
     if (was == Drag::Splitter || was == Drag::Column || was == Drag::PaneSplit || was == Drag::PreviewSplit) { ConfigSave(); Redraw(); return; }
-    if (was == Drag::Tab || was == Drag::Scrollbar || was == Drag::Marquee || was == Drag::InputSelect) { Redraw(); return; }
+    if (was == Drag::Tab && g_tabTearing) {
+        g_tabTearing = false;
+        TabGhostHide();
+        TearOffTab(g_dragIdx);
+        Redraw();
+        return;
+    }
+    if (was == Drag::Scrollbar || was == Drag::Marquee || was == Drag::InputSelect || was == Drag::Tab) { Redraw(); return; }
     if (was == Drag::SidePress && g_sideDrag.kind != ZNone) {
         SideDrag sd = g_sideDrag;
         g_sideDrag = SideDrag{};
@@ -5919,6 +6112,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COPYDATA: {
             auto* cds = reinterpret_cast<COPYDATASTRUCT*>(lp);
             if (SearchHandleCopyData(hwnd, cds)) return TRUE;
+            if (cds && cds->dwData == kCopyDataTabMove) {
+                std::wstring all(reinterpret_cast<const wchar_t*>(cds->lpData), cds->cbData / sizeof(wchar_t));
+                while (!all.empty() && all.back() == 0) all.pop_back();
+                std::vector<std::wstring> f;
+                size_t a = 0;
+                for (size_t b; (b = all.find(L'\x1f', a)) != std::wstring::npos; a = b + 1) f.push_back(all.substr(a, b - a));
+                f.push_back(all.substr(a));
+                if (f.size() < 5) return FALSE;
+                int at = AddTab(f[0], true, (int)g_tabs.size(), &f[1], _wtoi(f[2].c_str()) & 1);
+                g_tabs[at].color = (uint32_t)wcstoul(f[3].c_str(), nullptr, 10);
+                g_tabs[at].locked = f[4] == L"1";
+                ShowMainWindow();
+                Redraw();
+                return TRUE;
+            }
             if (cds && cds->dwData == 0x5354 /*'ST'*/) {
                 std::wstring path(reinterpret_cast<const wchar_t*>(cds->lpData), cds->cbData / sizeof(wchar_t));
                 while (!path.empty() && path.back() == 0) path.pop_back();
@@ -5929,8 +6137,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_CLOSE:
             if (g_focus == Focus::Rename) CommitRename(true);
-            SaveSession();
-            if (wp != 1 && g_config.keepInTray) {
+            if (!g_secondary) SaveSession();
+            if (wp != 1 && g_config.keepInTray && !g_secondary) {
                 // stay ready in the tray for instant opening
                 ShowWindow(hwnd, SW_HIDE);
                 PreviewHandlerClose();
@@ -5991,7 +6199,7 @@ HWND MainCreate(HINSTANCE inst, const std::vector<std::wstring>& openPaths, bool
     RegisterClassExW(&wc);
 
     // initial placement
-    RECT r = g_config.windowRect;
+    RECT r = g_secondary ? g_newWin.rect : g_config.windowRect;
     bool haveRect = r.right - r.left > 300 && r.bottom - r.top > 200;
     if (haveRect) {
         // make sure it's on a monitor
@@ -6023,10 +6231,12 @@ HWND MainCreate(HINSTANCE inst, const std::vector<std::wstring>& openPaths, bool
     QueueInit(g_hwnd);
     SizesInit(g_hwnd);
     IndexInit(g_hwnd);
-    AutoUpdateInit(g_hwnd, cmdLine);
-    g_releaseAppForUpdate = ReleaseForUpdate;
-    AutoUpdateApplySettings();
-    DefaultFileManagerRepairPath();
+    if (!g_secondary) {   // only the first window updates Strata and looks after Windows integration
+        AutoUpdateInit(g_hwnd, cmdLine);
+        g_releaseAppForUpdate = ReleaseForUpdate;
+        AutoUpdateApplySettings();
+        DefaultFileManagerRepairPath();
+    }
 
     // drag and drop into Strata: onto a folder row, a pane, a tab, a pin or a drive
     DropHandlers dh;
@@ -6068,7 +6278,12 @@ HWND MainCreate(HINSTANCE inst, const std::vector<std::wstring>& openPaths, bool
     DragDropRegister(g_hwnd, dh);
 
     // tabs: restored session, then anything passed on the command line
-    if (g_config.restoreSession)
+    if (g_secondary) {
+        int at = AddTab(g_newWin.left, false, -1, &g_newWin.right, g_newWin.pane);
+        g_tabs[at].color = g_newWin.color;
+        g_tabs[at].locked = g_newWin.locked;
+        g_tabs[at].born = 0;
+    } else if (g_config.restoreSession)
         for (auto& st : g_config.session) {
             std::wstring l = st.left.empty() || IsDirectory(st.left) || !ArchiveOf(st.left).empty() ? st.left : L"";
             std::wstring r2 = st.right.empty() || IsDirectory(st.right) || !ArchiveOf(st.right).empty() ? st.right : L"";
@@ -6077,7 +6292,7 @@ HWND MainCreate(HINSTANCE inst, const std::vector<std::wstring>& openPaths, bool
             g_tabs[at].color = st.color;
             g_tabs[at].born = 0;
         }
-    int active = std::clamp(g_config.sessionActive, 0, std::max(0, (int)g_tabs.size() - 1));
+    int active = g_secondary ? 0 : std::clamp(g_config.sessionActive, 0, std::max(0, (int)g_tabs.size() - 1));
     for (auto& p : openPaths) { MainOpenPath(p, true); active = (int)g_tabs.size() - 1; }
     if (g_tabs.empty()) {
         // first run: This PC on the left, your profile folder on the right
@@ -6091,10 +6306,11 @@ HWND MainCreate(HINSTANCE inst, const std::vector<std::wstring>& openPaths, bool
     WatchActive();
     ListDrivesAsync(g_hwnd);
     SetTimer(g_hwnd, TIMER_DRIVES, 60 * 1000, nullptr);
-    if (g_config.keepInTray || StartWithWindowsEnabled()) TrayAdd(g_hwnd);
+    if (!g_secondary && (g_config.keepInTray || StartWithWindowsEnabled())) TrayAdd(g_hwnd);
 
     if (!startHidden) {
-        ShowWindow(g_hwnd, g_config.maximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
+        ShowWindow(g_hwnd, g_config.maximized && !g_secondary ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
+        if (g_secondary) SetForegroundWindow(g_hwnd);
         UpdateWindow(g_hwnd);
     }
     if (!CrashGuardMessage().empty()) SetStatus(CrashGuardMessage());

@@ -1,7 +1,6 @@
-## Strata 0.3.4
+## Strata 0.3.5
 
-- **Slow double-click to rename**, like File Explorer. Click the name of a file or folder that's already selected, pause, and the name becomes editable.
-  - A normal double-click still opens it.
-  - Dragging, pressing a key, or clicking somewhere else cancels the rename.
-  - The click that brings Strata to the front doesn't count, so switching windows never starts a rename by accident.
-  - In the list view it starts only when you click the name itself, not the empty space beside it.
+- **Drag tabs out into their own window**, like a web browser. Pull a tab down or off the tab bar, and a small preview follows the cursor. Let go and the tab opens in a new Strata window right there, keeping both of its panes, its tab color and its lock.
+- **Drag a tab onto another Strata window** to move it into that window. A torn-off window's last tab can go back too, and the empty window closes.
+- Press **Esc** while dragging to cancel.
+- Only your first Strata window remembers its tabs between sessions, sits in the tray and installs updates. The extra windows are for working side by side.
